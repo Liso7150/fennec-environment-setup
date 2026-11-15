@@ -113,7 +113,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan["config"]["workspace"], plan["config"]["suite_root"])
         labels = [action["label"] for action in plan["actions"]]
         self.assertIn("install editable core", labels)
-        self.assertIn("install editable cli", labels)
+        self.assertIn("build CLI (cargo build --release)", labels)
         self.assertTrue(plan["config_write"])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -181,7 +181,8 @@ class PlanTests(unittest.TestCase):
         (root / "Cargo.toml").parent.mkdir(parents=True, exist_ok=True)
         (root / "Cargo.toml").write_text("[package]\nname = 'fennec'\n", encoding="utf-8")
         plan = self.plan(build=True)
-        build = next(action for action in plan["actions"] if "cargo" in action["label"])
+        build = next(action for action in plan["actions"]
+                     if action["label"] == "build Fennec (cargo build --release)")
         self.assertEqual(build["argv"], ["cargo", "build", "--release"])
         self.assertEqual(build["cwd"], slash(root))
         self.assertEqual(build["requires"], [slash(root / "Cargo.toml")])
