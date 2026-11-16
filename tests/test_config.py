@@ -103,7 +103,7 @@ class ValidateConfigTests(unittest.TestCase):
     def test_remote_engine_requires_environment_key(self):
         with self.assertRaises(ValueError):
             validate_config(REMOTE, environ={})
-        # Fennec reads both names, so the COLI_API_KEY alias keeps working.
+        # The legacy c/coli launcher reads COLI_API_KEY, so it still counts.
         for alias in ("COLI_API_KEY", "FENNEC_API_KEY"):
             with self.subTest(alias=alias):
                 validate_config(REMOTE, environ={alias: "k"})

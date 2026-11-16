@@ -149,8 +149,8 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
         if "core" in locations:
             needs.append(f"{locations['core']}/src/fennec-client/Cargo.toml")
         add("build CLI (cargo build --release)", ["cargo", "build", "--release"], project, needs)
-        warnings.append("The CLI is native Rust: `fennec`, `coli` and the `fennec-rs` glue come "
-                        "out of fennec-cli/target/release, not out of pip.")
+        warnings.append("The CLI is native Rust: `fennec` and its Rust glue come out "
+                        "of fennec-cli/target/release, not out of pip.")
     if "desktop" in locations:
         project = locations["desktop"]
         if not shutil.which("cargo"):

@@ -76,7 +76,7 @@ def validate_config(data, *, environ=None):
     if not isinstance(data, dict):
         raise ValueError("Shared config must be a JSON object")
     if any(k.lower() in SECRETS for k in data):
-        raise ValueError("Secrets belong in environment variables (FENNEC_API_KEY/COLI_API_KEY), not configuration JSON")
+        raise ValueError("Secrets belong in environment variables (FENNEC_API_KEY), not configuration JSON")
     if set(data) - KEYS:
         raise ValueError("Shared config must contain only supported runtime keys; never store secrets here")
     for key, value in data.items():
@@ -100,7 +100,10 @@ def validate_config(data, *, environ=None):
         raise ValueError("engine_url must be an HTTP(S) origin without credentials, port 0, path, query or fragment")
     if environ is not None and not is_loopback(url.hostname):
         if not (environ.get("FENNEC_API_KEY") or environ.get("COLI_API_KEY")):
-            raise ValueError("A non-loopback engine requires FENNEC_API_KEY or COLI_API_KEY in the environment")
+            raise ValueError(
+            "A non-loopback engine requires FENNEC_API_KEY in the environment "
+            "(COLI_API_KEY for the legacy c/coli launcher)"
+        )
     if data.get("openbot_url"):
         # The outlet itself may only be loopback (core refuses to drive a remote
         # OpenBot), but the hub only checks the shape of what the user wrote.
