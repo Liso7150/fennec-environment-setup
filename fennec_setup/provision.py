@@ -232,9 +232,15 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
         # fennec-agent only prints argparse and quits.
         run.append({"label": "shared agent (reads shared config)", "argv": [entry, "serve"]})
     if "desktop" in locations:
-        exe = "fennec-desktop.exe" if windows else "fennec-desktop"
+        suffix = ".exe" if windows else ""
+        release = Path(locations["desktop"]) / "target" / "release"
+        # The gpui binary is the current shell. A checkout built without the
+        # `gui` feature has only the earlier egui one, so the advice names a
+        # binary that exists instead of one the user cannot run.
+        names = [f"fennec-desktop-gui{suffix}", f"fennec-desktop{suffix}"]
+        exe = next((n for n in names if (release / n).exists()), names[0])
         run.append({"label": "desktop", "cwd": locations["desktop"],
-                    "argv": [str(Path(locations["desktop"]) / "target" / "release" / exe)]})
+                    "argv": [str(release / exe)]})
     if "mobile" in features or dev.client_only or dev.termux:
         warnings.append("Mobile = shared core + coding-agent PWA, on the same device (Termux) or reached from another device over trusted HTTPS with FENNEC_APP_TOKEN. The engine starts on demand; there is no automatic public exposure.")
     if dev.client_only:
