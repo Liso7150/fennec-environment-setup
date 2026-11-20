@@ -12,11 +12,33 @@ dates.
 ## [Unreleased] — 1.0.0 in preparation
 
 Nothing at 1.0.0 is published. The newest release here is `v0.9.0`
-(2026-11-11T19:29Z). Measured on the working tree: 68 tests pass
-(`python -m unittest discover -s tests`, 2026-11-15).
+(2026-11-11T19:29Z). Measured on the working tree: 73 tests pass
+(`python -m unittest discover -s tests`, 2026-11-20).
 
 ### Added
 - README hero published
+- the `economy` concept (`Liso7150/fennec-economy`) and its `requires` entries on
+  `inference`, `desktop` and `coding-agent`. The three Rust crates those features build all
+  declare `fennec-economy = { path = "../fennec-economy" }`, so a plan that fetched them
+  without it produced a `cargo build --release` that failed on a repo the hub had never
+  heard of — measured: `no matching package named 'fennec-economy' found ... required by
+  package 'fennec-rs v1.0.0'`.
+- `crate_sibling()`: the two cargo builds now list the sibling `fennec-economy/Cargo.toml`
+  (and `fennec-ui/Cargo.toml` for the desktop) in their `requires`, so `execute_plan` refuses
+  the whole plan with a named missing file instead of failing halfway through an install.
+- `web_python` config key (`FENNEC_WEB_PYTHON`): which interpreter runs Fennec's own
+  browser loop, for a machine that already has one
+- `browser-outlets` now fills the lane's own interpreter: it creates
+  `~/.fennec/browser-tools/fennec/.venv` and pip-installs the pinned
+  `browser-harness` transport into it, never into the interpreter the apps run on
+
+### Removed
+- the second browser lane. `jev` is gone from `repos.json` (concept and credit), the
+  `--jev-root` / `--web-engine` flags are gone, and so are the `jev_root` / `web_engine`
+  config keys. Both are retired rather than unknown: a config written while they existed
+  still loads, because `read_config` prunes the pair, and the next `write_config` drops it
+- `web_task` has one lane: Fennec's own loop on Liquid's hosted **d1.2**, which needs a
+  `LIQUID_API_KEY` and an interpreter that can import `browser_harness.helpers`
 
 ## [0.9.0] - 2026-11-11
 

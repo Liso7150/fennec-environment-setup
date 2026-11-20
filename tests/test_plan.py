@@ -13,13 +13,14 @@ from unittest import mock
 from fennec_setup import devices  # noqa: E402
 from fennec_setup.devices import Device, detect, recommend  # noqa: E402
 from fennec_setup.fetch import load_manifest, repos_for_features  # noqa: E402
-from fennec_setup.provision import (build_plan, print_plan, resolve_engine,  # noqa: E402
-                                    selected_features)
+from fennec_setup.provision import (BROWSER_TRANSPORT, browser_env, build_plan,  # noqa: E402
+                                    print_plan, resolve_engine, selected_features)
 
-CONCEPTS = ("engine", "core", "cli", "desktop", "coding-agent", "jetbrains", "installer", "finetune")
-# Someone else's programs: cloned when the user opts into the outlets, never
+CONCEPTS = ("engine", "core", "cli", "desktop", "coding-agent", "ui", "economy",
+            "jetbrains", "installer", "finetune")
+# Someone else's program: cloned when the user opts into the outlets, never
 # installed into, patched, or pulled by an ordinary update.
-UPSTREAMS = (("jev", "browser-use/jev-ultrafast"), ("openbot", "CopilotKit/OpenBot"))
+UPSTREAMS = (("openbot", "CopilotKit/OpenBot"),)
 WINDOWS = sys.platform.startswith("win")
 FENNEC_EXE = "fennec.exe" if WINDOWS else "fennec"
 
@@ -31,15 +32,15 @@ def manifest():
                  + [{"concept": concept, "repo": repo, "branch": "main", "upstream": True}
                     for concept, repo in UPSTREAMS],
         "features": {
-            "inference": {"requires": ["engine", "core", "cli"]},
-            "desktop": {"requires": ["engine", "core", "desktop", "coding-agent"]},
-            "coding-agent": {"requires": ["engine", "core", "coding-agent"]},
+            "inference": {"requires": ["engine", "core", "cli", "economy"]},
+            "desktop": {"requires": ["engine", "core", "desktop", "coding-agent", "ui", "economy"]},
+            "coding-agent": {"requires": ["engine", "core", "coding-agent", "economy"]},
             "jetbrains": {"requires": ["engine", "core", "jetbrains"]},
             "npu": {"requires": ["core"],
                     "pip": ["openvino", "openvino-tokenizers", "numpy", "huggingface-hub"]},
             "fine-tune": {"requires": ["engine", "finetune"], "pip": ["airllm", "torch"]},
             "mobile": {"requires": ["core", "coding-agent"]},
-            "browser-outlets": {"requires": ["core", "jev", "openbot"]},
+            "browser-outlets": {"requires": ["core", "openbot"]},
             "installer": {"requires": ["installer"]},
         },
         "credits": [],
@@ -121,6 +122,34 @@ class PlanTests(unittest.TestCase):
         self.assertIn("Plan only", out.getvalue())
         engine = next(repo for repo in plan["repos"] if repo["concept"] == "engine")
         self.assertEqual(engine["local"], slash(self.home / "engine"))
+
+    def test_cargo_builds_require_their_path_dependency_checkouts(self):
+        # fennec-cli and fennec-desktop both say `fennec-economy = { path = "../fennec-economy" }`
+        # (and the desktop adds `../fennec-ui`). A plan that fetches the app but not the crate
+        # reaches a cargo error no feature line explains, so the sibling manifests are
+        # preflighted like every other requirement.
+        cli = next(a for a in self.plan()["actions"]
+                   if a["label"] == "build CLI (cargo build --release)")
+        self.assertIn(slash(self.home / "suite/fennec-economy/Cargo.toml"), cli["requires"])
+        desktop = next(a for a in self.plan(features=("desktop",))["actions"]
+                       if a["label"] == "build desktop (cargo build --release)")
+        self.assertIn(slash(self.home / "suite/fennec-economy/Cargo.toml"), desktop["requires"])
+        self.assertIn(slash(self.home / "suite/fennec-ui/Cargo.toml"), desktop["requires"])
+
+    def test_the_shipped_manifest_fetches_what_its_cargo_builds_compile(self):
+        shipped = load_manifest(ROOT / "repos.json")
+        concepts = {repo["concept"]: repo for repo in shipped["repos"]}
+        self.assertIn("economy", concepts)
+        self.assertEqual(concepts["economy"]["repo"], "Liso7150/fennec-economy")
+        # Each of these three selects a checkout whose Cargo.toml says
+        # `fennec-economy = { path = "../fennec-economy" }`, and two of them are compiled by
+        # this hub. `mobile` is exempt: it takes the PWA assets as files and compiles nothing.
+        for name in ("inference", "desktop", "coding-agent"):
+            needed = set(shipped["features"][name]["requires"])
+            self.assertIn("economy", needed,
+                          f"{name} selects a crate that path-depends on fennec-economy without fetching it")
+        self.assertIn("ui", set(shipped["features"]["desktop"]["requires"]),
+                      "the desktop build has no fennec-ui to compile against")
 
     def test_machine_readable_plan(self):
         plan = self.plan()
@@ -268,22 +297,65 @@ class PlanTests(unittest.TestCase):
                          slash(self.home / "models") + "/embed/bge-base-en-v1.5-int8-ov")
         self.assertTrue(any("sidecar" in message for message in plan["warnings"]))
 
-    def test_browser_outlets_are_cloned_and_otherwise_untouched(self):
+    def test_browser_outlets_clone_openbot_and_fill_fennecs_own_env(self):
         plan = self.plan(features=("inference", "browser-outlets"))
         locations = {repo["concept"]: repo["local"] for repo in plan["repos"]}
-        self.assertEqual(locations["jev"], slash(self.home / "suite/jev-ultrafast"))
         self.assertEqual(locations["openbot"], slash(self.home / "suite/OpenBot"))
+        self.assertNotIn("jev", locations, "the deleted lane must not return as a checkout")
+        venv, venv_python = browser_env(self.home, windows=WINDOWS)
+        by_label = {action["label"]: action for action in plan["actions"]}
+        self.assertEqual(by_label["create Fennec's browser env"]["argv"][-1], venv)
+        self.assertEqual(by_label["install the browser transport"]["argv"][0], venv_python)
+        self.assertIn(BROWSER_TRANSPORT, by_label["install the browser transport"]["argv"])
+        # Neither step may declare a requires entry: execute_plan checks them all before it
+        # runs the first action, and the interpreter the second calls is what the first makes.
+        self.assertEqual(by_label["create Fennec's browser env"]["requires"], [])
+        self.assertEqual(by_label["install the browser transport"]["requires"], [])
+        # The transport is the one package that must never reach the shared interpreter,
+        # because that is where the desktop, the PWA server and the CLI glue all run.
+        others = " ".join(" ".join(action["argv"]) for action in plan["actions"]
+                          if action["label"] != "install the browser transport")
+        self.assertNotIn("browser-harness", others)
         for action in plan["actions"]:
-            joined = " ".join(action["argv"])
-            for outlet in ("jev-ultrafast", "OpenBot"):
-                self.assertNotIn(outlet, joined, f"{action['label']} would install into upstream")
-            self.assertNotIn(action.get("cwd"), {locations["jev"], locations["openbot"]},
-                             f"{action['label']} would run inside an outlet checkout")
+            self.assertNotIn("OpenBot", " ".join(action["argv"]),
+                             f"{action['label']} would install into upstream")
+            self.assertNotEqual(action.get("cwd"), locations["openbot"],
+                                f"{action['label']} would run inside an outlet checkout")
         self.assertTrue(any("cloned only" in message for message in plan["warnings"]))
-        self.assertTrue(any("TypeSafe" in message for message in plan["warnings"]))
         self.assertTrue(any("loopback" in message for message in plan["warnings"]))
+        self.assertTrue(any("the Fennec browser env" in message for message in plan["warnings"]),
+                        plan["warnings"])
+        self.assertFalse([m for m in plan["warnings"] if "TypeSafe" in m or "jev" in m.lower()],
+                         "a warning about a lane that no longer exists")
+        # web_task's lane is not a checkout, so it is the one thing the clone notes would
+        # never mention: a paid decision API and a browser-capable interpreter.
+        self.assertTrue(any("d1.2" in message and "LIQUID_API_KEY" in message
+                            for message in plan["warnings"]), plan["warnings"])
         # The shared core is what drives both, so it is the only thing installed.
         self.assertIn("install editable core", [action["label"] for action in plan["actions"]])
+
+    def test_one_outlet_lane_is_not_reported_as_no_lane(self):
+        # The shipped feature always brings both halves, but the notes are keyed on the
+        # locations and the feature name, so a single-purpose plan must describe only itself.
+        picked = manifest()
+        picked["features"]["coworker"] = {"requires": ["core", "openbot"]}
+        picked["features"]["plain-core"] = {"requires": ["core"]}
+        with_clone = build_plan(picked, ("inference", "coworker"), overrides=self.overrides,
+                                config=str(self.config), environ={}, home=self.home,
+                                device=device())
+        self.assertFalse(any("coworker_task stays unadvertised" in message
+                             for message in with_clone["warnings"]), with_clone["warnings"])
+        self.assertFalse([action for action in with_clone["actions"] if "browser" in action["label"]],
+                         "an unselected feature must not create a venv")
+        without_clone = build_plan(picked, ("inference", "plain-core"), overrides=self.overrides,
+                                   config=str(self.config), environ={}, home=self.home,
+                                   device=device())
+        self.assertTrue(any("coworker_task stays unadvertised" in message
+                            for message in without_clone["warnings"]), without_clone["warnings"])
+        # No OpenBot checkout is not the same as no web_task: Fennec's own loop needs only
+        # an interpreter with the transport and a key.
+        self.assertTrue(any("web_task is unaffected" in message
+                            for message in without_clone["warnings"]), without_clone["warnings"])
 
     def test_shipped_manifest_covers_every_sidecar_import(self):
         packages = load_manifest()["features"]["npu"]["pip"]
@@ -302,6 +374,10 @@ class PlanTests(unittest.TestCase):
     def test_a_core_without_outlets_says_which_tools_stay_off(self):
         plan = self.plan(features=("inference",))
         self.assertTrue(any("web_task" in message and "coworker_task" in message
+                            for message in plan["warnings"]), plan["warnings"])
+        # No checkout is not the same as no web_task: Fennec's own loop needs only an
+        # interpreter with the transport and a key.
+        self.assertTrue(any("coworker_task stays unadvertised" in message
                             for message in plan["warnings"]), plan["warnings"])
         with_outlets = self.plan(features=("inference", "browser-outlets"))
         self.assertFalse(any("No browser outlet selected" in message
@@ -413,24 +489,35 @@ class ManifestTests(unittest.TestCase):
         upstreams = " ".join(entry["upstream"] for entry in credits)
         self.assertIn("JustVugg/colibri", upstreams)
         self.assertIn("lyogavin/airllm", upstreams)
-        self.assertIn("browser-use/jev-ultrafast", upstreams)
         self.assertIn("CopilotKit/OpenBot", upstreams)
+        # The loop's transport is third-party code the installer pulls, so it is credited
+        # like the upstreams that are only cloned.
+        self.assertIn("browser-use/browser-harness", upstreams)
+        # d1.2 spends money on every browser step, so it is credited like the code upstreams.
+        self.assertIn("api.liquid.ai", upstreams)
+        self.assertFalse([entry for entry in credits if "jev" in entry["upstream"].lower()],
+                         "a credit for a lane that no longer exists")
         engine = next(entry for entry in credits if "JustVugg/colibri" in entry["upstream"])
         self.assertIn("base idea", engine["role"])
+        liquid = next(entry for entry in credits if "api.liquid.ai" in entry["upstream"])
+        self.assertIn("LIQUID_API_KEY", liquid["role"])
 
     def test_outlet_upstreams_are_cloned_only(self):
         repos = {repo["concept"]: repo for repo in self.manifest["repos"]}
-        self.assertEqual(repos["jev"]["repo"], "browser-use/jev-ultrafast")
         self.assertEqual(repos["openbot"]["repo"], "CopilotKit/OpenBot")
-        for concept in ("jev", "openbot"):
-            self.assertTrue(repos[concept].get("upstream"), concept)
-            self.assertNotEqual(repos[concept]["repo"].split("/")[0], self.manifest["account"])
+        self.assertTrue(repos["openbot"].get("upstream"))
+        self.assertNotEqual(repos["openbot"]["repo"].split("/")[0], self.manifest["account"])
+        self.assertFalse([repo for repo in self.manifest["repos"]
+                          if "jev" in repo["concept"]], "Jev was deleted, not made optional")
         self.assertFalse([repo for repo in self.manifest["repos"]
                           if repo.get("upstream") and repo["repo"].startswith("Liso7150/")],
                          "a Fennec-owned checkout must stay updatable by 'update'")
         spec = self.manifest["features"]["browser-outlets"]
-        self.assertEqual(set(spec["requires"]), {"core", "jev", "openbot"})
-        self.assertNotIn("pip", spec, "the outlets are cloned, never installed into")
+        self.assertEqual(set(spec["requires"]), {"core", "openbot"})
+        self.assertNotIn("pip", spec, "OpenBot is cloned, never installed into")
+        # The lane's own dependency goes to the venv, so the description has to say where.
+        self.assertIn("browser-harness", spec["description"])
+        self.assertIn("~/.fennec/browser-tools/fennec/.venv", spec["description"])
 
     def test_all_includes_the_optional_outlets(self):
         self.assertIn("browser-outlets",
@@ -462,10 +549,9 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(calls[0][:2], ["pull", "--ff-only"])
 
     def test_an_update_leaves_an_upstream_outlet_where_its_maintainers_put_it(self):
-        for concept in ("jev", "openbot"):
-            message, calls = self.pulled(self.repo(concept, upstream=True), [])
-            self.assertIn("untouched", message, concept)
-            self.assertEqual(calls, [], f"{concept} was moved by an update")
+        message, calls = self.pulled(self.repo("openbot", upstream=True), [])
+        self.assertIn("untouched", message)
+        self.assertEqual(calls, [], "openbot was moved by an update")
 
     def test_the_fennec_engine_is_pulled_like_any_other_fennec_checkout(self):
         engine = next(repo for repo in load_manifest()["repos"] if repo["concept"] == "engine")
@@ -476,13 +562,13 @@ class FetchTests(unittest.TestCase):
     def test_a_missing_upstream_is_still_cloned(self):
         import tempfile
         fetch_module = self.module()
-        repo = self.repo("jev", upstream=True)
+        repo = self.repo("openbot", upstream=True)
         with tempfile.TemporaryDirectory() as directory:
-            repo["local"] = str(Path(directory) / "suite" / "jev-ultrafast")
+            repo["local"] = str(Path(directory) / "suite" / "OpenBot")
             with mock.patch.object(fetch_module, "validate_checkout", return_value=False), \
                  mock.patch.object(fetch_module, "_git", return_value="") as git:
                 message = fetch_module.fetch_repo(repo, update=True)
-        self.assertIn("cloned jev", message)
+        self.assertIn("cloned openbot", message)
         self.assertEqual(git.call_args_list[0].args[0][:2], ["clone", "--branch"])
 
 

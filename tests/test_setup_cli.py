@@ -69,13 +69,16 @@ class SetupCliTests(unittest.TestCase):
         self.assertIn("lyogavin/airllm", out)
         self.assertEqual(update.call_count, 2)
 
-    def test_update_never_pulls_the_upstream_outlet_checkouts(self):
+    def test_update_never_pulls_the_upstream_outlet_checkout(self):
         import importlib
         from unittest import mock
         fetch_module = importlib.import_module("fennec_setup.fetch")
         with tempfile.TemporaryDirectory() as directory:
             suite = Path(directory) / "suite"
-            for name in ("fennec-core", "jev-ultrafast", "OpenBot"):
+            # jev-ultrafast is what an install from before the single browser lane left
+            # behind. It is no longer a repo the manifest knows, so update walks past it
+            # instead of refusing or pulling a checkout Fennec no longer drives.
+            for name in ("fennec-core", "OpenBot", "jev-ultrafast"):
                 (suite / name / ".git").mkdir(parents=True)
             with mock.patch.object(fetch_module, "fetch_repo", return_value="updated") as update:
                 code, out, err = self.run_main([
@@ -83,8 +86,8 @@ class SetupCliTests(unittest.TestCase):
                     str(Path(directory) / "config.json")])
         self.assertEqual(code, 0, err)
         self.assertIn("Updated 1 checkout(s)", out)
-        self.assertIn("skip jev", out)
         self.assertIn("skip openbot", out)
+        self.assertNotIn("jev", out, "an update note about a deleted repo")
         self.assertEqual(update.call_count, 1)
 
     def test_update_without_checkouts_fails_honestly(self):

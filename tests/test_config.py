@@ -9,8 +9,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from fennec_setup.config import (KEYS, action_environment, read_config, resolve_config,
-                                 validate_config, write_config)  # noqa: E402
+from fennec_setup.config import (ENV, KEYS, RETIRED, action_environment,  # noqa: E402
+                                 read_config, resolve_config, validate_config, write_config)
 
 SYSTEM = platform.system()
 
@@ -50,11 +50,14 @@ SHARED_CASES = [
     ({"engine_url": "ftp://127.0.0.1:8184"}, False),
     ({"engine_url": "http://127.0.0.1:0"}, False),
     ({"engine_url": "http://192.168.1.5:8184"}, False),
-    ({"jev_root": ""}, True),
-    ({"jev_root": "~/jev-ultrafast"}, True),
     ({"openbot_url": "http://127.0.0.1:3001"}, True),
     ({"openbot_url": "https://bot.example"}, True),
     ({"openbot_url": ""}, False),
+    # `ort` is a backend the engine ships, and web_python is the key core writes to pin
+    # which interpreter runs its own browser loop.
+    ({"backend": "ort"}, True),
+    ({"web_python": ""}, True),
+    ({"web_python": "~/browsenv/python"}, True),
 ]
 
 REMOTE = {"engine_url": "http://192.168.1.5:8184"}
@@ -73,8 +76,11 @@ def _locate_core():
     candidates.append(ROOT.parent / "Fennec-Suite" / "fennec-core")
     candidates.append(Path.home() / "Fennec-Suite" / "fennec-core")
     candidates.append(ROOT.parent / "fennec-core")
+    # The core's modules sit at the checkout root, so one name identifies it no
+    # better than a stray config.py in any other project. All four must be there.
+    modules = ("acp", "config", "outlets", "setup_wizard")
     for candidate in candidates:
-        if (candidate / "fennec_core" / "config.py").is_file():
+        if all((candidate / f"{name}.py").is_file() for name in modules):
             return candidate
     return None
 
@@ -131,7 +137,7 @@ class CoreParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         sys.path.insert(0, str(_locate_core()))
-        import fennec_core.config as core
+        import config as core
         cls.core = core
 
     def test_validator_parity(self):
@@ -272,30 +278,59 @@ class KeysTests(unittest.TestCase):
     def test_shared_key_set(self):
         self.assertEqual(KEYS, {"engine_root", "suite_root", "models_root", "cache_root",
                                 "python", "model", "engine_url", "web_root", "workspace",
-                                "backend", "ctx", "policy", "jev_root", "openbot_url"})
+                                "backend", "ctx", "policy", "openbot_url", "web_python"})
+
+    def test_the_retired_pair_is_neither_writable_nor_readable(self):
+        # Jev was the second browser lane. Its keys have to stay unknown to the validator,
+        # or a new install would write them again, and unknown to ENV, or an exported
+        # FENNEC_JEV_ROOT would reach the actions of a product that ignores the path.
+        self.assertEqual(RETIRED, {"jev_root", "web_engine"})
+        self.assertFalse(RETIRED & KEYS)
+        self.assertFalse(RETIRED & set(ENV.values()))
+        for key in sorted(RETIRED):
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    validate_config({key: "anything"}, environ={})
+
+    def test_an_install_from_the_two_lane_days_still_loads_and_is_rewritten_clean(self):
+        # Core ignores an unknown key; the hub refuses one, so reading is what has to
+        # forgive or every pre-single-lane config would fail the hub's own check.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"engine_root": "~/Fennec", "ctx": 4096,
+                                        "jev_root": "~/suite/jev-ultrafast",
+                                        "web_engine": "jev"}), encoding="utf-8")
+            self.assertEqual(read_config(path, environ={}), {"engine_root": "~/Fennec", "ctx": 4096})
+            write_config(path, {"ctx": 8192}, ["ctx"], environ={})
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved, {"engine_root": "~/Fennec", "ctx": 8192})
 
     def test_outlet_keys_survive_resolve_and_are_exported_to_actions(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             values, _ = resolve_config({}, config=home / "config.json", environ={}, system=SYSTEM,
                                        home=home, exists=lambda path: False,
-                                       overrides={"jev_root": "browser-tools/jev-ultrafast",
-                                                  "openbot_url": "http://127.0.0.1:3001"})
-            self.assertTrue(values["jev_root"].endswith("/browser-tools/jev-ultrafast"))
+                                       overrides={"openbot_url": "http://127.0.0.1:3001",
+                                                  "web_python": "browser-tools/browsenv/python"})
             self.assertEqual(values["openbot_url"], "http://127.0.0.1:3001")
+            # The interpreter is absolute because an action may run from another directory.
+            self.assertTrue(values["web_python"].endswith("/browser-tools/browsenv/python"))
+            self.assertTrue(Path(values["web_python"]).is_absolute())
             env = action_environment(values, {})
-        self.assertEqual(env["FENNEC_JEV_ROOT"], values["jev_root"])
         self.assertEqual(env["FENNEC_OPENBOT_URL"], "http://127.0.0.1:3001")
+        self.assertEqual(env["FENNEC_WEB_PYTHON"], values["web_python"])
+        self.assertFalse([name for name in env if "JEV" in name or "WEB_ENGINE" in name])
 
-    def test_unconfigured_outlets_stay_out_of_the_config(self):
-        # The core probes its own default locations, so writing an absolute
-        # jev_root nobody asked for would pin a path that later breaks.
+    def test_an_unpinned_browser_env_stays_out_of_the_config(self):
+        # Discovery finds the venv by its own rule, so writing a web_python nobody asked for
+        # would turn a machine setting into a user choice that later installs inherit.
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             values, _ = resolve_config({}, config=home / "config.json", environ={}, system=SYSTEM,
-                                        home=home, exists=lambda path: False)
-        self.assertNotIn("jev_root", values)
+                                       home=home, exists=lambda path: False)
+        self.assertNotIn("web_python", values)
         self.assertNotIn("openbot_url", values)
+        self.assertFalse(RETIRED & values.keys())
 
 
 if __name__ == "__main__":

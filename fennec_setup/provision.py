@@ -24,12 +24,29 @@ class InstallError(RuntimeError):
 # of the interpreter the Fennec apps also use.
 EMBED_IR_REPO = "OpenVINO/bge-base-en-v1.5-int8-ov"
 
-# Mirrors fennec-core/fennec_core/engine.py:_engine_binary, the canonical rule.
+# Mirrors fennec-core/engine.py:_engine_binary, the canonical rule.
 FENNEC_DIRS = ("target/release", "target/debug", ".")
+
+# Mirrors fennec-core/outlets.py:BROWSER_ENV: the venv web_task's transport lives in.
+# It is home-relative because that is where the core looks for it; --root does not move
+# it, and a venv the core cannot find is an install that did not happen.
+BROWSER_ENV = (".fennec", "browser-tools", "fennec")
+# The transport pinned to the version whose module layout the loop imports
+# (browser_harness.helpers.cdp, browser_harness.admin.ensure_daemon). A bare name would
+# let an upstream reshape of those two modules break a Fennec build that still expects them.
+BROWSER_TRANSPORT = "browser-harness==0.1.13"
 
 
 def _slash(path):
     return str(path).replace("\\", "/")
+
+
+def browser_env(home=None, *, windows=None):
+    """Return (venv root, interpreter) for Fennec's own browser venv under home."""
+    windows = os.name == "nt" if windows is None else windows
+    root = Path(home or Path.home()).joinpath(*BROWSER_ENV, ".venv")
+    bins = ("Scripts", "python.exe") if windows else ("bin", "python")
+    return _slash(root), _slash(root.joinpath(*bins))
 
 
 def resolve_engine(engine_root, *, windows=None):
@@ -128,24 +145,46 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
                     requires=[f"{project}/pyproject.toml"])
         if packages:
             add("install selected optional dependencies", [python, "-m", "pip", "install", *packages])
+        if "browser-outlets" in features:
+            # The transport belongs to the lane, not to the interpreter every Fennec app
+            # runs on: browser-harness brings cdp_use, fetch_use, pillow and websockets with
+            # it, and the core deliberately does not depend on any of them.
+            venv, venv_python = browser_env(home, windows=windows)
+            # Neither step declares a `requires` entry. execute_plan verifies all of them
+            # before it runs the first action, and the interpreter the second step calls is
+            # the file the first one creates.
+            add("create Fennec's browser env", [python, "-m", "venv", venv])
+            add("install the browser transport", [venv_python, "-m", "pip", "install", BROWSER_TRANSPORT])
         if "npu" in features:
             # The desktop/IDE sidecar imports openvino from this same interpreter and
             # looks for IR under models_root/embed, so provision both in place.
             embed_dir = f"{values['models_root']}/embed/{EMBED_IR_REPO.split('/')[1]}"
+            # No `requires` entry: the interpreter is preflighted above, `python` may be a
+            # bare PATH name no file check can resolve, and huggingface_hub is installed by
+            # the dependency action that runs before this one.
             add("fetch the sidecar embedding model (prebuilt OpenVINO IR)",
                 [python, "-c",
                  "import sys; from huggingface_hub import snapshot_download; "
                  "snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])",
-                 EMBED_IR_REPO, embed_dir],
-                requires=[python])
+                 EMBED_IR_REPO, embed_dir])
             warnings.append("The NPU/iGPU sidecar runs the device probe and the batched code index only; token generation stays on the Fennec engine.")
             warnings.append("The sidecar uses prebuilt OpenVINO IR, so optimum-intel (and the torch/nncf tree behind it) is never installed here.")
+    def crate_sibling(project, name):
+        # A cargo build resolves `../name` against the checkout it runs in, which is the
+        # suite root. Naming those manifests here makes execute_plan refuse the whole plan
+        # when a path-dependency checkout is absent, instead of a cargo run failing
+        # halfway through an install with an error that points at neither this hub nor
+        # the feature that should have fetched it.
+        parent = str(project).replace("\\", "/").rstrip("/").rsplit("/", 1)[0]
+        return f"{parent}/{name}/Cargo.toml"
+
     if "cli" in locations:
         project = locations["cli"]
         if not shutil.which("cargo"):
             missing.append("Rust: install Rust so cargo is on PATH (rustup) before building the CLI")
-        # The launcher and the glue both path-depend on the fennec-core crates.
-        needs = [f"{project}/Cargo.toml"]
+        # The launcher and the glue both path-depend on the fennec-core crates and on
+        # fennec-economy (the one Rust implementation of context compaction).
+        needs = [f"{project}/Cargo.toml", crate_sibling(project, "fennec-economy")]
         if "core" in locations:
             needs.append(f"{locations['core']}/src/fennec-client/Cargo.toml")
         add("build CLI (cargo build --release)", ["cargo", "build", "--release"], project, needs)
@@ -155,9 +194,10 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
         project = locations["desktop"]
         if not shutil.which("cargo"):
             missing.append("Rust: install Rust so cargo is on PATH (rustup) before building the desktop app")
-        # The app path-depends on the fennec-core Rust workspace, so the sibling
-        # checkout is part of what makes this build possible.
-        needs = [f"{project}/Cargo.toml"]
+        # The app path-depends on the fennec-core Rust workspace, on fennec-economy and on
+        # fennec-ui, so the sibling checkouts are part of what makes this build possible.
+        needs = [f"{project}/Cargo.toml", crate_sibling(project, "fennec-economy"),
+                 crate_sibling(project, "fennec-ui")]
         if "core" in locations:
             needs.append(f"{locations['core']}/src/fennec-client/Cargo.toml")
         add("build desktop (cargo build --release)", ["cargo", "build", "--release"], project, needs)
@@ -201,17 +241,20 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
         warnings.append("JetBrains plugin is fetched only; build/package it separately using its README and JDK/Gradle requirements.")
     if "finetune" in locations:
         warnings.append("Training dependencies are selected; datasets, model weights and training runs are never downloaded/started implicitly.")
-    if "jev" in locations or "openbot" in locations:
-        # The hub is allowed to clone these two and nothing more: they are someone
-        # else's programs, and the shared core drives them from its own process.
-        warnings.append("Browser outlets are cloned only: this hub never modifies, patches, vendors, installs dependencies for or starts jev-ultrafast or OpenBot. Check what the core found with `fennec outlets`.")
-    if "jev" in locations:
-        warnings.append(f"Jev spends the TypeSafe key configured inside its own checkout ({locations['jev']}/.env) or TYPESAFE_API_KEY in its environment; Fennec never reads or stores it.")
     if "openbot" in locations:
+        # The hub is allowed to clone this one and nothing more: OpenBot is someone else's
+        # program, and the shared core drives it from its own process.
+        warnings.append("OpenBot is cloned only: this hub never modifies, patches, vendors, installs dependencies for or starts it. Check what the core found with `fennec outlets`.")
         warnings.append("OpenBot is a separate Next.js service: set it up and start it with its own README commands, then the core reaches it over loopback AG-UI routes (default http://127.0.0.1:3001, override with --openbot-url or FENNEC_OPENBOT_URL).")
         warnings.append("OpenBot issues no machine token for its run API, so only a loopback single-user instance is driven; a remote one is refused by the core.")
-    elif "core" in locations:
-        warnings.append("No browser outlet selected, so the core advertises neither web_task nor coworker_task; add --features browser-outlets later to fetch them (cloned only, never started here).")
+    if "core" in locations:
+        # d1.2 is the one lane that costs money per step, so the plan says so even when no
+        # outlet checkout was selected: the loop runs from an ordinary interpreter.
+        warnings.append("web_task is Fennec's own browser loop: it asks a Liquid d1 model one question per step (the hosted d1.2 is a paid API, LIQUID_API_KEY; the free open-weight d1-2B needs a local LIQUID_ENDPOINT instead of a key) and needs an interpreter that can import browser_harness.helpers. --features browser-outlets installs one, --web-python pins any other, and `fennec outlets` says which of the two gates is missing.")
+    if "browser-outlets" in features:
+        warnings.append(f"The browser transport goes into Fennec's own venv ({browser_env(home, windows=windows)[0]}), never into the interpreter the apps run on; the core looks there by itself, and `fennec outlets` then reports transport_from: \"the Fennec browser env\".")
+    if "core" in locations and "openbot" not in locations:
+        warnings.append("No OpenBot workspace selected, so coworker_task stays unadvertised; web_task is unaffected, since Fennec's own loop is not a checkout.")
     if model_status == "missing":
         warnings.append("Inference is NOT ready: no existing model selected. Pass --model /path/to/existing/model. No model download is automatic (35B models can be enormous).")
     if values["backend"] != "cpu":
@@ -333,7 +376,7 @@ def add_plan_options(parser):
     parser.add_argument("--root", help="clean layout: ROOT/{engine,suite,models,cache}")
     parser.add_argument("--config", help="shared config path; default FENNEC_CONFIG or ~/.fennec/config.json")
     for key in ROOTS + ("python", "model", "engine_url", "web_root", "workspace", "backend",
-                        "policy", "jev_root", "openbot_url"):
+                        "policy", "openbot_url", "web_python"):
         parser.add_argument("--" + key.replace("_", "-"))
     parser.add_argument("--ctx", type=int)
     parser.add_argument("--build", action="store_true", help="include/execute the engine build with install (cargo build --release for Fennec)")

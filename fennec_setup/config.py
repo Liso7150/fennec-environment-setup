@@ -12,15 +12,26 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOTS = ("engine_root", "suite_root", "models_root", "cache_root")
-# Mirrors fennec-core/fennec_core/config.py: jev_root and openbot_url are the two
-# optional browser outlets, so a config written by core validates here too.
+# Mirrors fennec-core/config.py: openbot_url is the optional coworker outlet, and
+# web_python says which interpreter runs Fennec's own browser loop. A config core
+# writes must validate here too, or an install that already works fails the hub's check.
 KEYS = set(ROOTS) | {"python", "model", "engine_url", "web_root", "workspace", "backend",
-                     "ctx", "policy", "jev_root", "openbot_url"}
+                     "ctx", "policy", "openbot_url", "web_python"}
 ENV = {"engine_root": "FENNEC_HOME", "models_root": "FENNEC_MODELS",
        "cache_root": "FENNEC_CACHE", "python": "FENNEC_PYTHON",
        "model": "FENNEC_MODEL", "engine_url": "FENNEC_ENGINE_URL",
-       "workspace": "FENNEC_WORKSPACE", "jev_root": "FENNEC_JEV_ROOT",
-       "openbot_url": "FENNEC_OPENBOT_URL"}
+       "workspace": "FENNEC_WORKSPACE",
+       "openbot_url": "FENNEC_OPENBOT_URL", "web_python": "FENNEC_WEB_PYTHON"}
+# Jev used to be a second browser agent that `web_engine` could pin and `jev_root`
+# could point at. There is one lane now, so neither key means anything; old configs
+# still carry them, and reading one has to drop the pair rather than refuse the file.
+# Their FENNEC_* environment spellings need no list: they are no longer in ENV, so
+# they are never read.
+RETIRED = {"jev_root", "web_engine"}
+# Empty is a real answer for exactly these, and it is core's rule: "no model yet",
+# "no second agent installed", "discover whichever interpreter can browse". A key
+# accepted empty here but not there would produce a config that fails to load.
+EMPTY_OK = {"model", "web_python"}
 # Pre-Fennec Windows paths an old manifest or config may still carry. They are
 # recognised so they can be migrated, but never chosen as a default: not every
 # machine has a D: drive, and the installer lets the user pick any drive.
@@ -34,9 +45,10 @@ ENGINE_LEGACY = ("D:/Colibri", "~/Colibri")
 ENGINE_FALLBACK = "~/Colibri"
 LEGACY_VALUES = {key: (LEGACY[key],) for key in ROOTS}
 LEGACY_VALUES["engine_root"] += ENGINE_LEGACY
-# Mirrors fennec-core/fennec_core/config.py (authoritative shared schema).
+# Mirrors fennec-core/config.py (authoritative shared schema). `ort` is
+# the ONNX Runtime portability backend, so a config that names it must plan here too.
 SECRETS = {"api_key", "app_token", "token", "fennec_api_key", "fennec_app_token", "coli_api_key"}
-BACKENDS = ("auto", "cuda", "vulkan", "metal", "cpu")
+BACKENDS = ("auto", "cuda", "vulkan", "metal", "ort", "cpu")
 POLICIES = ("quality", "balanced", "experimental-fast")
 
 
@@ -83,10 +95,10 @@ def validate_config(data, *, environ=None):
         if key == "ctx":
             if type(value) is not int or not 0 <= value <= 1_048_576:
                 raise ValueError("ctx must be an integer from 0 (automatic) to 1048576")
-        elif not isinstance(value, str) or (not value.strip() and key not in {"model", "jev_root"}):
+        elif not isinstance(value, str) or (not value.strip() and key not in EMPTY_OK):
             raise ValueError(f"{key} must be a nonempty string (omit an unselected model or outlet)")
     if data.get("backend", "auto") not in BACKENDS:
-        raise ValueError("backend must be auto, vulkan, metal or cpu; NPU is not a decoder")
+        raise ValueError("backend must be auto, cuda, vulkan, metal, ort or cpu; NPU is not a decoder")
     if data.get("policy", "quality") not in POLICIES:
         raise ValueError("policy must be quality, balanced or experimental-fast")
     try:
@@ -123,6 +135,11 @@ def read_config(path, *, environ=None):
     if not path.exists():
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        # Pruned before the strict key check, so an install that predates the single
+        # browser lane still loads; the next write_config leaves the file without them.
+        for key in RETIRED:
+            data.pop(key, None)
     validate_config(data, environ=environ)
     return data
 
@@ -192,10 +209,10 @@ def resolve_config(manifest, *, root=None, config=None, overrides=None, environ=
         values["python"] = absolute(values["python"], system=system, home=home)
     if values.get("model"):
         values["model"] = absolute(values["model"], system=system, home=home, base=values["models_root"])
-    # Unset jev_root is a feature, not an omission: the core probes its own default
-    # locations, including suite_root/jev-ultrafast, so no absolute path is written.
-    if values.get("jev_root"):
-        values["jev_root"] = absolute(values["jev_root"], system=system, home=home, base=path.parent)
+    # web_python is an interpreter this machine launches, so like `python` it is written
+    # absolute; a bare name stays bare, so PATH may still resolve it.
+    if values.get("web_python") and re.search(r"[~/\\]", values["web_python"]):
+        values["web_python"] = absolute(values["web_python"], system=system, home=home)
     validate_config(values, environ=env)
     return values, path
 
