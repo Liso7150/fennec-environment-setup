@@ -37,12 +37,10 @@ EMPTY_OK = {"model", "web_python"}
 # machine has a D: drive, and the installer lets the user pick any drive.
 LEGACY = dict(zip(ROOTS, ("D:/Fennec", "D:/Fennec-Suite", "D:/fennec-models", "D:/.cache")))
 PORTABLE = dict(zip(ROOTS, ("~/Fennec", "~/Fennec-Suite", "~/fennec-models", "~/.cache/fennec")))
-# The engine was the Colibri Python launcher before Fennec. Both spellings of its
-# root stay recognised as legacy manifest values, and a Colibri checkout already
-# on disk is the fallback engine root: c/coli speaks the same verbs and the same
-# OpenAI-compatible HTTP contract, so nothing an old install has is orphaned.
+# Pre-Fennec engine roots an old manifest may still carry. They are recognised only
+# so they migrate to the portable Fennec default: Fennec is the only engine now, so
+# a Colibri checkout on disk is never chosen as an engine root.
 ENGINE_LEGACY = ("D:/Colibri", "~/Colibri")
-ENGINE_FALLBACK = "~/Colibri"
 LEGACY_VALUES = {key: (LEGACY[key],) for key in ROOTS}
 LEGACY_VALUES["engine_root"] += ENGINE_LEGACY
 # Mirrors fennec-core/config.py (authoritative shared schema). `ort` is
@@ -111,10 +109,11 @@ def validate_config(data, *, environ=None):
     if not valid:
         raise ValueError("engine_url must be an HTTP(S) origin without credentials, port 0, path, query or fragment")
     if environ is not None and not is_loopback(url.hostname):
+        # COLI_API_KEY is accepted only as a legacy alias of FENNEC_API_KEY; the
+        # engine itself is Fennec, never the old launcher.
         if not (environ.get("FENNEC_API_KEY") or environ.get("COLI_API_KEY")):
             raise ValueError(
-            "A non-loopback engine requires FENNEC_API_KEY in the environment "
-            "(COLI_API_KEY for the legacy c/coli launcher)"
+            "A non-loopback engine requires FENNEC_API_KEY in the environment"
         )
     if data.get("openbot_url"):
         # The outlet itself may only be loopback (core refuses to drive a remote
@@ -157,11 +156,6 @@ def resolve_config(manifest, *, root=None, config=None, overrides=None, environ=
     if unknown:
         raise ValueError(f"Unsupported overrides: {sorted(unknown)}")
     values = {}
-    # The shipped manifest already names ~/Fennec, which is the default rather
-    # than a user choice, so it still allows the Colibri fallback below.
-    engine_choice = manifest.get("engine_root")
-    engine_defaulted = (not engine_choice or engine_choice == PORTABLE["engine_root"]
-                        or engine_choice in LEGACY_VALUES["engine_root"])
     for key in ROOTS:
         candidate = manifest.get(key)
         if not candidate or candidate in LEGACY_VALUES[key]:
@@ -173,15 +167,6 @@ def resolve_config(manifest, *, root=None, config=None, overrides=None, environ=
         root = absolute(root, system=system, home=home)
         values.update(dict(zip(ROOTS, (f"{root}/engine", f"{root}/suite", f"{root}/models", f"{root}/cache"))))
     values.update(explicit)
-    # Fennec first, Colibri only as a fallback, and only when nothing chose an
-    # engine root: a manifest default plus an existing Colibri checkout keeps an
-    # old install launching instead of pointing at an empty ~/Fennec.
-    if (engine_defaulted and not root and "engine_root" not in saved
-            and "engine_root" not in explicit and not env.get(ENV["engine_root"])):
-        fennec = Path(absolute(PORTABLE["engine_root"], system=system, home=home))
-        colibri = Path(absolute(ENGINE_FALLBACK, system=system, home=home))
-        if not exists(fennec) and exists(colibri):
-            values["engine_root"] = str(colibri).replace("\\", "/")
     # Reject empty strings and invalid enums before normalizing paths.
     validate_config(values, environ=env)
     for key in ROOTS:
@@ -259,6 +244,5 @@ def action_environment(config, environ=None):
     env = dict(os.environ if environ is None else environ)
     env.update({name: str(config[key]) for key, name in ENV.items() if key in config})
     cache = config["cache_root"]
-    env.update(HF_HOME=f"{cache}/huggingface", PIP_CACHE_DIR=f"{cache}/pip",
-               npm_config_cache=f"{cache}/npm")
+    env.update(HF_HOME=f"{cache}/huggingface", PIP_CACHE_DIR=f"{cache}/pip")
     return env

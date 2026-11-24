@@ -201,19 +201,19 @@ class DefaultsTests(unittest.TestCase):
                 values = self.resolve(manifest={"engine_root": legacy})
                 self.assertEqual(values["engine_root"], slash(self.home / "Fennec"))
 
-    def test_an_existing_colibri_checkout_is_the_fallback_engine_root(self):
-        # Nothing chose a root and only the legacy engine is on disk: keep it
-        # launchable instead of pointing at an empty ~/Fennec.
+    def test_an_existing_colibri_checkout_is_never_chosen(self):
+        # Fennec is the only engine: a legacy checkout on disk does not become
+        # the engine root, even when nothing chose one.
         for manifest in ({}, {"engine_root": "~/Fennec"}):
             with self.subTest(manifest=manifest):
                 values = self.resolve(manifest=manifest, exists=self.only_colibri)
-                self.assertEqual(values["engine_root"], slash(self.home / "Colibri"))
+                self.assertEqual(values["engine_root"], slash(self.home / "Fennec"))
 
     def test_fennec_wins_when_both_roots_exist(self):
         values = self.resolve(exists=lambda path: True)
         self.assertEqual(values["engine_root"], slash(self.home / "Fennec"))
 
-    def test_a_chosen_engine_root_is_never_replaced_by_the_fallback(self):
+    def test_a_chosen_engine_root_is_never_replaced_by_a_default(self):
         values = self.resolve(exists=self.only_colibri,
                               overrides={"engine_root": slash(self.home / "chosen")})
         self.assertEqual(values["engine_root"], slash(self.home / "chosen"))

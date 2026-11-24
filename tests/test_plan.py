@@ -132,7 +132,7 @@ class PlanTests(unittest.TestCase):
                    if a["label"] == "build CLI (cargo build --release)")
         self.assertIn(slash(self.home / "suite/fennec-economy/Cargo.toml"), cli["requires"])
         desktop = next(a for a in self.plan(features=("desktop",))["actions"]
-                       if a["label"] == "build desktop (cargo build --release)")
+                       if a["label"] == "build desktop (cargo build --release --features gui)")
         self.assertIn(slash(self.home / "suite/fennec-economy/Cargo.toml"), desktop["requires"])
         self.assertIn(slash(self.home / "suite/fennec-ui/Cargo.toml"), desktop["requires"])
 
@@ -174,9 +174,9 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(plan["run"])
         self.assertTrue(any("same device" in message for message in plan["warnings"]))
 
-    def fennec_binary(self, rel="target/release"):
+    def fennec_binary(self, rel="target/release", name=None):
         """A fake built engine; nothing in these tests ever executes it."""
-        binary = self.home / "engine" / rel / FENNEC_EXE
+        binary = self.home / "engine" / rel / (name or FENNEC_EXE)
         binary.parent.mkdir(parents=True, exist_ok=True)
         binary.write_bytes(b"")
         return slash(binary)
@@ -193,7 +193,7 @@ class PlanTests(unittest.TestCase):
         (model / "config.json").write_text("{}", encoding="utf-8")
         return model
 
-    def test_fennec_binary_wins_over_the_colibri_launcher_in_the_same_root(self):
+    def test_a_leftover_colibri_launcher_is_ignored_beside_a_fennec_binary(self):
         binary = self.fennec_binary()
         self.colibri_launcher()
         model = self.selected_model()
@@ -230,6 +230,35 @@ class PlanTests(unittest.TestCase):
                         plan["missing"])
         self.assertTrue(any(action["argv"] == ["cargo", "build", "--release"] for action in plan["actions"]))
 
+    def test_a_pre_edition_2024_toolchain_is_reported_before_the_build_runs(self):
+        # Every first-party crate is edition 2024 (rust-version 1.85). cargo on PATH used
+        # to be the whole check, so 1.84 reached `cargo build` and died on an error that
+        # named the edition instead of the toolchain.
+        from fennec_setup import provision
+        with mock.patch.object(provision, "rustc_version", return_value=(1, 84, 0)):
+            plan = self.plan(build=True)
+        rust = [m for m in plan["missing"] if m.startswith("Rust:")]
+        self.assertTrue(any("building the CLI" in m for m in rust), plan["missing"])
+        self.assertTrue(any("building Fennec" in m for m in rust), plan["missing"])
+        for message in rust:
+            self.assertIn("rustc 1.84.0", message)
+            self.assertIn("edition 2024", message)
+            self.assertIn("rustup update", message)
+
+    def test_a_current_toolchain_adds_no_rust_requirement(self):
+        from fennec_setup import provision
+        with mock.patch.object(provision, "rustc_version", return_value=(1, 85, 0)):
+            plan = self.plan(build=True)
+        self.assertFalse([m for m in plan["missing"] if m.startswith("Rust:")], plan["missing"])
+
+    def test_an_unreadable_rustc_version_does_not_invent_a_failure(self):
+        # A plan that cannot read the compiler still has cargo; refusing to build on a
+        # guess would block machines the check was only meant to reassure.
+        from fennec_setup import provision
+        with mock.patch.object(provision, "rustc_version", return_value=None):
+            plan = self.plan(build=True)
+        self.assertFalse([m for m in plan["missing"] if m.startswith("Rust:")], plan["missing"])
+
     def test_fennec_serve_advice_has_no_python_prefix(self):
         binary = self.fennec_binary()
         model = self.selected_model()
@@ -241,6 +270,62 @@ class PlanTests(unittest.TestCase):
                                  "--host", "127.0.0.1", "--port", "8184"])
         self.assertNotIn(plan["config"]["python"], serve)
 
+    def test_the_plan_says_the_engine_validates_nothing_before_loading(self):
+        # fennec serve mmaps config.json + *.safetensors and converts nothing, so a packed
+        # checkpoint handed to it directly answers in fluent nonsense instead of erroring.
+        # The hub has no format classifier, so it must name the component that does rather
+        # than imply the serve command it prints is safe for any model path.
+        self.fennec_binary()
+        model = self.selected_model()
+        plan = build_plan(manifest(), ["inference"], overrides=dict(self.overrides, model=str(model)),
+                          config=str(self.config), environ={}, home=self.home, device=device())
+        self.assertIn("the engine reads it as-is", plan["model_status"])
+        serve = [message for message in plan["warnings"] if "fennec serve --model" in message]
+        self.assertEqual(len(serve), 1, plan["warnings"])
+        for claim in ("config.json", "*.safetensors", "converts nothing", "fennec-convert"):
+            self.assertIn(claim, serve[0])
+        self.assertEqual(plan["run"][0]["label"], "engine (after native build and model validation)")
+
+    def test_a_model_path_is_never_reported_as_a_validated_model(self):
+        # A lone container file is exactly the shape the engine cannot serve. The hub cannot
+        # tell it from a converted directory without reading the folder, so "unchecked" is the
+        # honest status; a "valid" wording would advertise a check that does not exist.
+        packed = self.home / "model.safetensors"
+        packed.write_bytes(b"")
+        plan = build_plan(manifest(), ["inference"], overrides=dict(self.overrides, model=str(packed)),
+                          config=str(self.config), environ={}, home=self.home, device=device())
+        self.assertIn("format and size unchecked", plan["model_status"])
+        self.assertNotIn("valid", plan["model_status"])
+        self.assertTrue(any("fennec serve --model" in message for message in plan["warnings"]),
+                        plan["warnings"])
+
+    def test_a_macos_and_linux_plan_are_posix_end_to_end(self):
+        for system in ("Darwin", "Linux"):
+            with self.subTest(system=system):
+                # This machine can only ever run the Windows branch of the wizard, yet every
+                # product repo claims Win+Linux+macOS support. provision.py takes the binary
+                # suffixes, the browser venv layout and the fxc.exe advice from dev.os, so the
+                # posix branch is asserted here instead of left to a machine nobody has.
+                model = self.selected_model()
+                self.fennec_binary(name="fennec")
+                dev = device(os=system, arch="arm64" if system == "Darwin" else "x86_64",
+                             metal=system == "Darwin", vulkan=system != "Darwin",
+                             cuda=False, tier="metal" if system == "Darwin" else "vulkan")
+                plan = build_plan(manifest(), ["inference", "desktop", "coding-agent", "browser-outlets"],
+                                  overrides=dict(self.overrides, model=str(model)),
+                                  config=str(self.config), environ={}, home=self.home, device=dev)
+                text = "\n".join([*plan["warnings"], plan["engine_launcher"] or "",
+                                  *(" ".join(entry["argv"]) for entry in plan["run"]),
+                                  *(" ".join(action["argv"]) for action in plan["actions"])])
+                self.assertEqual(plan["engine_launcher"],
+                                 slash(self.home / "engine/target/release/fennec"))
+                self.assertFalse([name for name in ("fennec.exe", "coli.exe", "fennec-agent.exe",
+                                                    "fennec-desktop-gui.exe") if name in text], text)
+                self.assertIn("/bin/python", text)
+                self.assertNotIn("fxc.exe", text)
+                labels = {entry["label"] for entry in plan["run"]}
+                self.assertTrue(any(label.startswith("coding-agent PWA/API") for label in labels), labels)
+
     def test_an_unbuilt_root_still_names_the_release_binary(self):
         plan = self.plan(build=True)
         expected = slash(self.home / "engine/target/release" / FENNEC_EXE)
@@ -248,35 +333,29 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan["engine_kind"], "fennec")
         self.assertTrue(any(expected in message for message in plan["missing"]), plan["missing"])
 
-    def test_legacy_colibri_root_keeps_the_python_launcher_advice(self):
+    def test_a_colibri_only_root_expects_a_fennec_build(self):
         model = self.selected_model()
-        launcher = self.colibri_launcher()
+        self.colibri_launcher()
         overrides = dict(self.overrides, model=str(model))
         plan = build_plan(manifest(), ["inference"], overrides=overrides, build=True,
                           config=str(self.config), environ={}, home=self.home, device=device())
         labels = [action["label"] for action in plan["actions"]]
-        self.assertIn("build engine for the selected model", labels)
-        self.assertIn("verify engine for the selected model", labels)
-        build = next(action for action in plan["actions"]
-                     if action["label"] == "build engine for the selected model")
-        self.assertEqual(build["argv"][1:], [launcher, "build", "--model", slash(model)])
-        self.assertEqual(build["requires"], [slash(self.home / "engine/c/Makefile")])
+        self.assertIn("build Fennec (cargo build --release)", labels)
+        self.assertNotIn("build engine for the selected model", labels)
         serve = plan["run"][0]["argv"]
-        self.assertEqual(serve[:3], [plan["config"]["python"], launcher, "serve"])
+        self.assertEqual(serve[0], slash(self.home / "engine/target/release" / FENNEC_EXE))
         self.assertIn("--auto-tier", serve)
         self.assertEqual(serve[serve.index("--host") + 1], "127.0.0.1")
         self.assertEqual(serve[serve.index("--port") + 1], "8184")
-        self.assertEqual(plan["engine_launcher"], launcher)
-        self.assertEqual(plan["engine_kind"], "colibri")
-        self.assertTrue(any("legacy Colibri launcher" in message for message in plan["warnings"]))
+        self.assertEqual(plan["engine_kind"], "fennec")
+        self.assertTrue(any("Engine binary missing" in message for message in plan["missing"]))
+        self.assertFalse(any("Colibri" in message for message in plan["warnings"]))
 
-    def test_legacy_build_without_a_model_uses_a_real_make_target(self):
+    def test_no_make_target_is_planned_for_any_root(self):
         self.colibri_launcher()
         plan = self.plan(build=True)
-        action = next(action for action in plan["actions"] if "native target" in action["label"])
-        self.assertEqual(action["argv"][-1], "fennec")
-        self.assertNotIn(".exe", " ".join(action["argv"]))
-        self.assertEqual(action["requires"], [slash(self.home / "engine/c/Makefile")])
+        self.assertFalse(any("make" in action["argv"] for action in plan["actions"]))
+        self.assertFalse(any("native target" in action["label"] for action in plan["actions"]))
 
     def test_npu_feature_provisions_the_sidecar_packages_and_ir_model(self):
         plan = self.plan(features=("inference", "npu"))
@@ -364,12 +443,16 @@ class PlanTests(unittest.TestCase):
         self.assertFalse([p for p in packages if "optimum" in p or p == "torch"],
                          "the IR model is downloaded, so no exporter belongs in the sidecar set")
 
-    def test_the_shared_agent_advice_is_a_runnable_command(self):
-        plan = self.plan()
-        agent = next(command for command in plan["run"] if "shared agent" in command["label"])
-        # A bare fennec-agent only prints "the following arguments are required".
-        self.assertEqual(agent["argv"][-1], "serve")
-        self.assertIn("fennec-agent", Path(agent["argv"][0]).name)
+    def test_the_agent_advice_names_the_rust_front_door_and_a_separate_core(self):
+        plan = self.plan(features=("desktop",))
+        rust = next(command for command in plan["run"] if "coding-agent PWA/API" in command["label"])
+        # The Rust binary starts the server directly; it takes no `serve` verb.
+        self.assertEqual(rust["argv"][1:], [])
+        self.assertIn("fennec-agent", Path(rust["argv"][0]).name)
+        self.assertIn("8788", rust["label"])
+        core = next(command for command in plan["run"] if "Python core compatibility" in command["label"])
+        self.assertEqual(core["argv"][-2:], ["--port", "8790"])
+        self.assertIn("serve", core["argv"])
 
     def test_a_core_without_outlets_says_which_tools_stay_off(self):
         plan = self.plan(features=("inference",))
@@ -419,14 +502,15 @@ class EngineResolverTests(unittest.TestCase):
         self.touch("c/coli")
         self.assertEqual(resolve_engine(self.root, windows=WINDOWS), (binary, "fennec", True))
 
-    def test_colibri_launcher_is_the_fallback(self):
-        launcher = self.touch("c/coli")
-        self.assertEqual(resolve_engine(self.root, windows=WINDOWS), (launcher, "colibri", True))
+    def test_a_colibri_launcher_alone_is_not_an_engine(self):
+        self.touch("c/coli")
+        expected = slash(self.root / "target/release" / FENNEC_EXE)
+        self.assertEqual(resolve_engine(self.root, windows=WINDOWS), (expected, "fennec", False))
 
     def test_posix_never_picks_a_windows_executable(self):
         self.touch("target/release/fennec.exe")
-        launcher = self.touch("c/coli")
-        self.assertEqual(resolve_engine(self.root, windows=False), (launcher, "colibri", True))
+        expected = slash(self.root / "target/release/fennec")
+        self.assertEqual(resolve_engine(self.root, windows=False), (expected, "fennec", False))
         binary = self.touch("target/release/fennec")
         self.assertEqual(resolve_engine(self.root, windows=False), (binary, "fennec", True))
 
@@ -436,12 +520,11 @@ class EngineResolverTests(unittest.TestCase):
         expected = slash(self.root / "target/release" / FENNEC_EXE)
         self.assertEqual(resolve_engine(self.root, windows=WINDOWS), (expected, "fennec", False))
 
-    def test_an_empty_root_expects_fennec_and_a_c_tree_expects_colibri(self):
+    def test_an_empty_root_and_a_c_tree_both_expect_fennec(self):
         expected = slash(self.root / "target/release" / FENNEC_EXE)
         self.assertEqual(resolve_engine(self.root, windows=WINDOWS), (expected, "fennec", False))
         (self.root / "c").mkdir()
-        self.assertEqual(resolve_engine(self.root, windows=WINDOWS),
-                         (slash(self.root / "c/coli"), "colibri", False))
+        self.assertEqual(resolve_engine(self.root, windows=WINDOWS), (expected, "fennec", False))
 
 
 class ManifestTests(unittest.TestCase):
@@ -477,11 +560,12 @@ class ManifestTests(unittest.TestCase):
     def test_the_engine_is_the_fennec_repo_and_is_updatable(self):
         engine = next(repo for repo in self.manifest["repos"] if repo["concept"] == "engine")
         self.assertEqual(engine["repo"], "Liso7150/fennec")
-        self.assertEqual(engine["branch"], "main")
+        self.assertEqual(engine["branch"], "master")
         self.assertFalse(engine.get("upstream"), "Fennec is our own repo, so update may pull it")
         self.assertEqual(self.manifest["engine_root"], "~/Fennec")
         self.assertIn("cargo build --release", engine["description"])
-        self.assertIn("c/coli", engine["description"], "the legacy fallback stays documented")
+        self.assertIn("only engine", engine["description"])
+        self.assertNotIn("c/coli", engine["description"], "no other engine is a fallback")
         self.assertIn("Fennec", self.manifest["features"]["inference"]["description"])
 
     def test_upstream_credits_present(self):
@@ -558,6 +642,8 @@ class FetchTests(unittest.TestCase):
         message, calls = self.pulled(dict(engine, local="/tmp/engine"), ["ok"])
         self.assertIn("updated engine", message)
         self.assertEqual(calls[0][:2], ["pull", "--ff-only"])
+        self.assertEqual(engine["repo"], "Liso7150/fennec")
+        self.assertEqual(engine["branch"], "master")
 
     def test_a_missing_upstream_is_still_cloned(self):
         import tempfile

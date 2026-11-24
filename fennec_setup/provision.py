@@ -36,9 +36,46 @@ BROWSER_ENV = (".fennec", "browser-tools", "fennec")
 # let an upstream reshape of those two modules break a Fennec build that still expects them.
 BROWSER_TRANSPORT = "browser-harness==0.1.13"
 
+# Every first-party crate is edition 2024 with rust-version 1.85, the first stable
+# that accepts it. cargo on PATH alone does not prove the toolchain can compile them.
+MIN_RUSTC = (1, 85)
+_rustc_cache = {}
+
 
 def _slash(path):
     return str(path).replace("\\", "/")
+
+
+def rustc_version():
+    """The toolchain's rustc version as a tuple, or None when it cannot be read."""
+    if "version" not in _rustc_cache:
+        _rustc_cache["version"] = None
+        exe = shutil.which("rustc")
+        if exe:
+            try:
+                out = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                                     timeout=20, encoding="utf-8", errors="replace").stdout
+            except (OSError, subprocess.SubprocessError):
+                out = ""
+            found = re.search(r"\b\d+\.\d+(?:\.\d+)?", out)
+            if found:
+                _rustc_cache["version"] = tuple(int(p) for p in found.group(0).split("."))
+    return _rustc_cache["version"]
+
+
+def rust_block(why):
+    """What a cargo build needs that this machine does not have, or None.
+
+    The old check stopped at "cargo is on PATH", so a pre-1.85 toolchain reached the
+    build and failed there with an error naming the edition, not the toolchain.
+    """
+    if not shutil.which("cargo"):
+        return f"Rust: install Rust so cargo is on PATH (rustup) before {why}"
+    version = rustc_version()
+    if version is not None and version < MIN_RUSTC:
+        return (f"Rust: rustc {'.'.join(map(str, version))} cannot {why} "
+                f"(needs {'.'.join(map(str, MIN_RUSTC))}+ for edition 2024), run `rustup update`")
+    return None
 
 
 def browser_env(home=None, *, windows=None):
@@ -50,14 +87,11 @@ def browser_env(home=None, *, windows=None):
 
 
 def resolve_engine(engine_root, *, windows=None):
-    """Return (path, kind, found) for the engine installed under engine_root.
+    """Return (path, kind, found) for the Fennec engine under engine_root.
 
-    Fennec is a native Rust binary and is launched directly; Colibri was a Python
-    launcher (c/coli) and still works from any configured root, because the CLI
-    verbs and the OpenAI-compatible HTTP contract are identical. Fennec wins when
-    both are installed. With nothing built yet, path names the artifact the plan
-    expects afterwards: a Cargo.toml (or an empty root) is Fennec, a c/ tree is
-    Colibri.
+    Fennec is the suite's only engine: a native Rust binary launched directly.
+    With nothing built yet, path names the artifact the plan expects afterwards;
+    a leftover c/coli launcher from another engine is never selected.
     """
     root = Path(engine_root)
     windows = os.name == "nt" if windows is None else windows
@@ -67,12 +101,7 @@ def resolve_engine(engine_root, *, windows=None):
             candidate = root / rel / name
             if candidate.is_file():
                 return _slash(candidate), "fennec", True
-    launcher = root / "c" / "coli"
-    if launcher.is_file():
-        return _slash(launcher), "colibri", True
-    if (root / "Cargo.toml").is_file() or not (root / "c").is_dir():
-        return _slash(root / "target/release" / names[0]), "fennec", False
-    return _slash(launcher), "colibri", False
+    return _slash(root / "target/release" / names[0]), "fennec", False
 
 
 def selected_features(manifest, features=None, all_features=False):
@@ -87,10 +116,8 @@ def selected_features(manifest, features=None, all_features=False):
 
 
 def build_plan(manifest, features, *, root=None, config=None, overrides=None,
-               build=False, native_target="fennec", update=False, device=None,
+               build=False, update=False, device=None,
                environ=None, home=None):
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", native_target):
-        raise ValueError("Native target must be a simple Makefile target, not options or shell text")
     values, path = resolve_config(manifest, root=root, config=config, overrides=overrides,
                                   environ=environ, home=home)
     dev = device or detect(values["models_root"])
@@ -180,8 +207,9 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
 
     if "cli" in locations:
         project = locations["cli"]
-        if not shutil.which("cargo"):
-            missing.append("Rust: install Rust so cargo is on PATH (rustup) before building the CLI")
+        cargo = rust_block("building the CLI")
+        if cargo:
+            missing.append(cargo)
         # The launcher and the glue both path-depend on the fennec-core crates and on
         # fennec-economy (the one Rust implementation of context compaction).
         needs = [f"{project}/Cargo.toml", crate_sibling(project, "fennec-economy")]
@@ -192,53 +220,52 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
                         "of fennec-cli/target/release, not out of pip.")
     if "desktop" in locations:
         project = locations["desktop"]
-        if not shutil.which("cargo"):
-            missing.append("Rust: install Rust so cargo is on PATH (rustup) before building the desktop app")
+        cargo = rust_block("building the desktop app")
+        if cargo:
+            missing.append(cargo)
         # The app path-depends on the fennec-core Rust workspace, on fennec-economy and on
         # fennec-ui, so the sibling checkouts are part of what makes this build possible.
         needs = [f"{project}/Cargo.toml", crate_sibling(project, "fennec-economy"),
                  crate_sibling(project, "fennec-ui")]
         if "core" in locations:
             needs.append(f"{locations['core']}/src/fennec-client/Cargo.toml")
-        add("build desktop (cargo build --release)", ["cargo", "build", "--release"], project, needs)
-        warnings.append("The desktop app is native Rust (egui/eframe); it is built, not npm-installed, and needs the suite fetched together.")
+        add("build desktop (cargo build --release --features gui)",
+            ["cargo", "build", "--release", "--features", "gui", "--bin", "fennec-desktop-gui"],
+            project, needs)
+        warnings.append("The desktop app is native Rust/GPUI (fennec-desktop-gui); it is built, not npm-installed, and needs the suite fetched together.")
+        if windows:
+            warnings.append("Windows release GPUI shader compilation needs fxc.exe from the Windows SDK on PATH; without it build the debug window (cargo build --features gui --bin fennec-desktop-gui).")
+    if "coding-agent" in locations:
+        project = locations["coding-agent"]
+        cargo = rust_block("building the coding-agent backend")
+        if cargo:
+            missing.append(cargo)
+        needs = [f"{project}/Cargo.toml", crate_sibling(project, "fennec-economy")]
+        if "core" in locations:
+            needs.append(f"{locations['core']}/src/fennec-client/Cargo.toml")
+            needs.append(f"{locations['core']}/src/fennec-workspace-tools/Cargo.toml")
+        add("build coding-agent (cargo build --release)", ["cargo", "build", "--release"], project, needs)
+        warnings.append("The PWA/API front door is the Rust fennec-agent binary from fennec-coding-agent/target/release; it binds 127.0.0.1:8787 and falls back to :8788 when occupied.")
     engine_root = values["engine_root"]
     engine_path, engine_kind, engine_found = resolve_engine(engine_root, windows=windows)
     model = values.get("model")
-    model_status = "existing path; format/size not validated" if model and Path(model).exists() else "missing"
+    model_status = ("existing path; the engine reads it as-is, format and size unchecked"
+                    if model and Path(model).exists() else "missing")
     if "engine" in locations:
         if not engine_found:
-            if engine_kind == "fennec":
-                missing.append(f"Engine binary missing: {engine_path}. Build Fennec with cargo build --release in {engine_root} (install --build plans it).")
-            else:
-                missing.append(f"Engine launcher missing: {engine_path}. Use a complete engine checkout.")
-        elif engine_kind == "colibri":
-            warnings.append(f"No Fennec binary under {engine_root}; the legacy Colibri launcher {engine_path} is used through Python. Build Fennec with cargo build --release to replace it.")
+            missing.append(f"Engine binary missing: {engine_path}. Build Fennec with cargo build --release in {engine_root} (install --build plans it).")
         if build:
-            if engine_kind == "fennec":
-                if not shutil.which("cargo"):
-                    missing.append("Rust: install Rust so cargo is on PATH (rustup) before building Fennec")
-                add("build Fennec (cargo build --release)", ["cargo", "build", "--release"], engine_root,
-                    [f"{engine_root}/Cargo.toml"])
-                if not model:
-                    warnings.append("No model selected, so cargo builds the engine only; pass --model /path/to/existing/model to make inference ready.")
-            else:
-                for tool, choices in (("make", ("make",)), ("C compiler", ("cc", "gcc", "clang"))):
-                    if not any(shutil.which(choice) for choice in choices):
-                        missing.append(f"Native toolchain: install {tool} (on Windows use a compatible MSYS2/MinGW toolchain)")
-                if model and Path(model).is_dir():
-                    add("build engine for the selected model", [python, engine_path, "build", "--model", model],
-                        requires=[f"{engine_root}/c/Makefile"])
-                    add("verify engine for the selected model", [python, engine_path, "info", "--model", model],
-                        requires=[f"{model}/config.json"])
-                else:
-                    add("build selected native target", ["make", "-C", f"{engine_root}/c", native_target],
-                        requires=[f"{engine_root}/c/Makefile"])
-                    warnings.append(f"No model selected, so make builds the {native_target!r} target. With a model, the launcher picks its engine family automatically.")
+            cargo = rust_block("building Fennec")
+            if cargo:
+                missing.append(cargo)
+            add("build Fennec (cargo build --release)", ["cargo", "build", "--release"], engine_root,
+                [f"{engine_root}/Cargo.toml"])
+            if not model:
+                warnings.append("No model selected, so cargo builds the engine only; pass --model /path/to/existing/model to make inference ready.")
         else:
-            warnings.append("Engine binaries are not built or verified by this plan; run install with --build (needs a compatible toolchain).")
+            warnings.append(f"Engine binaries are not built or verified by this plan; run install with --build (needs cargo and rustc {'.'.join(map(str, MIN_RUSTC))}+, the first stable with edition 2024).")
     if "jetbrains" in locations:
-        warnings.append("JetBrains plugin is fetched only; build/package it separately using its README and JDK/Gradle requirements.")
+        warnings.append("JetBrains plugin is fetched only; build/package it separately with its build-plugin.sh (FENNEC_IDE_PLATFORM plus the IDEA Kotlin compiler), then install the zip from the IDE's plugin settings.")
     if "finetune" in locations:
         warnings.append("Training dependencies are selected; datasets, model weights and training runs are never downloaded/started implicitly.")
     if "openbot" in locations:
@@ -261,31 +288,33 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
         warnings.append(f"Configured backend {values['backend']!r} requires an independently verified engine build; hardware detection does not prove decoding support.")
     run = []
     if "engine" in locations and model:
-        # Fennec is exec'd directly; only the legacy Colibri launcher needs Python.
         serve = [engine_path, "serve", "--auto-tier", "--model", model,
                  "--ctx", str(values["ctx"]), "--policy", values["policy"],
                  "--host", "127.0.0.1", "--port", "8184"]
-        run.append({"label": "engine (after native build and model validation)",
-                    "argv": serve if engine_kind == "fennec" else [python, *serve]})
+        run.append({"label": "engine (after native build and model validation)", "argv": serve})
+        # The engine mmaps config.json + *.safetensors and converts nothing, so a packed
+        # checkpoint handed to it by hand answers in fluent nonsense instead of erroring.
+        warnings.append("fennec serve --model takes a DIRECTORY holding config.json and *.safetensors; it converts nothing and validates nothing before loading. A packed int4 checkpoint or a .gguf folder must go through the core, which resolves and converts it first - that is what the desktop app, the PWA and `fennec-convert` do. Serving one directly is the failure mode, not a shortcut.")
+    if "coding-agent" in locations:
+        suffix = ".exe" if windows else ""
+        agent = Path(locations["coding-agent"]) / "target" / "release" / f"fennec-agent{suffix}"
+        run.append({"label": "coding-agent PWA/API (Rust; 127.0.0.1:8787, falls back to :8788)",
+                    "argv": [str(agent)]})
     if "core" in locations:
         base = Path(shutil.which(python) or python).parent
         scripts = base if base.name.lower() in ("scripts", "bin") else base / ("Scripts" if windows else "bin")
         entry = str(scripts / ("fennec-agent.exe" if windows else "fennec-agent"))
-        # The advice printed at the end is a command the user types; a bare
-        # fennec-agent only prints argparse and quits.
-        run.append({"label": "shared agent (reads shared config)", "argv": [entry, "serve"]})
+        # The Python core is a separate orchestration/ACP/compatibility service, not the
+        # PWA front door: give it a free port so it never shadows the Rust agent.
+        run.append({"label": "Python core compatibility service (ACP/outlets; not the PWA)",
+                    "argv": [entry, "serve", "--port", "8790"]})
     if "desktop" in locations:
         suffix = ".exe" if windows else ""
         release = Path(locations["desktop"]) / "target" / "release"
-        # The gpui binary is the current shell. A checkout built without the
-        # `gui` feature has only the earlier egui one, so the advice names a
-        # binary that exists instead of one the user cannot run.
-        names = [f"fennec-desktop-gui{suffix}", f"fennec-desktop{suffix}"]
-        exe = next((n for n in names if (release / n).exists()), names[0])
         run.append({"label": "desktop", "cwd": locations["desktop"],
-                    "argv": [str(release / exe)]})
+                    "argv": [str(release / f"fennec-desktop-gui{suffix}")]})
     if "mobile" in features or dev.client_only or dev.termux:
-        warnings.append("Mobile = shared core + coding-agent PWA, on the same device (Termux) or reached from another device over trusted HTTPS with FENNEC_APP_TOKEN. The engine starts on demand; there is no automatic public exposure.")
+        warnings.append("Mobile = Rust coding-agent backend + PWA, on the same device (Termux) or reached from another device over trusted HTTPS with FENNEC_APP_TOKEN. The engine starts on demand; there is no automatic public exposure.")
     if dev.client_only:
         actions = []
         missing.append("Android/iOS is PWA client mode only: execute this installation plan on a Windows/macOS/Linux host")
@@ -293,13 +322,13 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
     return {"features": list(features), "device": dev.to_dict(), "recommendation": rec,
             "config_path": str(path), "config": values, "explicit_keys": sorted(explicit),
             "repos": repos, "actions": actions, "build": build, "update": update,
-            "native_target": native_target, "engine_launcher": engine_path if "engine" in locations else None,
+            "engine_launcher": engine_path if "engine" in locations else None,
             "engine_kind": engine_kind if "engine" in locations else None,
             "model_status": model_status, "missing": missing, "warnings": warnings,
             "run": run, "credits": manifest.get("credits", []),
             "config_write": bool(needs_python or build) and not dev.client_only,
             "cache_environment": {k: v for k, v in action_environment(values, {}).items()
-                                  if k in ("HF_HOME", "PIP_CACHE_DIR", "npm_config_cache")}}
+                                  if k in ("HF_HOME", "PIP_CACHE_DIR")}}
 
 
 def print_plan(plan, machine=False):
@@ -379,8 +408,7 @@ def add_plan_options(parser):
                         "policy", "openbot_url", "web_python"):
         parser.add_argument("--" + key.replace("_", "-"))
     parser.add_argument("--ctx", type=int)
-    parser.add_argument("--build", action="store_true", help="include/execute the engine build with install (cargo build --release for Fennec)")
-    parser.add_argument("--native-target", default="fennec", help="legacy Colibri c/Makefile target when no model is selected (default fennec); unused for Fennec")
+    parser.add_argument("--build", action="store_true", help="include/execute the native builds with install (cargo build --release for Fennec and the CLI; the desktop adds --features gui)")
     parser.add_argument("--update", action="store_true", help="fast-forward clean matching tracked branches only")
     parser.add_argument("--json", action="store_true", help="machine-readable plan (plan mode only)")
 
@@ -390,4 +418,4 @@ def plan_from_args(manifest, args, features=None):
     overrides = {key: getattr(args, key, None) for key in KEYS}
     return build_plan(manifest, features or selected_features(manifest, args.features, args.all),
                       root=args.root, config=args.config, overrides=overrides,
-                      build=args.build, native_target=args.native_target, update=args.update)
+                      build=args.build, update=args.update)

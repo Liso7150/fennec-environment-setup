@@ -57,17 +57,21 @@ class SetupCliTests(unittest.TestCase):
         fetch_module = importlib.import_module("fennec_setup.fetch")
         with tempfile.TemporaryDirectory() as directory:
             suite = Path(directory) / "suite"
+            engine = Path(directory) / "engine"
             for name in ("fennec-core", "fennec-desktop"):
                 (suite / name / ".git").mkdir(parents=True)
+            (engine / ".git").mkdir(parents=True)
             with mock.patch.object(fetch_module, "fetch_repo", return_value="updated") as update:
                 code, out, err = self.run_main([
-                    "update", "--suite-root", str(suite), "--config",
-                    str(Path(directory) / "config.json")])
+                    "update", "--engine-root", str(engine), "--suite-root", str(suite),
+                    "--config", str(Path(directory) / "config.json")])
         self.assertEqual(code, 0, err)
-        self.assertIn("Updated 2 checkout(s)", out)
+        self.assertIn("Updated 3 checkout(s)", out)
         self.assertIn("JustVugg/colibri", out)
         self.assertIn("lyogavin/airllm", out)
-        self.assertEqual(update.call_count, 2)
+        self.assertEqual(update.call_count, 3)
+        self.assertEqual({call.args[0]["concept"] for call in update.call_args_list},
+                         {"engine", "core", "desktop"})
 
     def test_update_never_pulls_the_upstream_outlet_checkout(self):
         import importlib
