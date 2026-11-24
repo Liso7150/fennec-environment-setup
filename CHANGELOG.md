@@ -3,26 +3,29 @@
 All notable changes to fennec-environment-setup, the suite detection and planning hub.
 
 The sections below carry the published tag each change actually shipped in
-(`Liso7150/fennec-environment-setup`, `v0.1.0` … `v0.9.0`). An earlier revision
+(`Liso7150/fennec-environment-setup`, `v0.1.0` … `v1.0.0`). An earlier revision
 of this file numbered the same history on a 1.x/2.x ladder that was never
 published; those tags still exist locally (`v1.2.0` … `v2.0.0`) and each one
 points at the same commit as a published `v0.x` tag. Dates are the tag publish
 dates.
 
-## [Unreleased] — 1.0.0 in preparation
-
-Nothing at 1.0.0 is published (`fennec_setup.__version__` is `1.0.0`, `b3d0053`).
-The newest release here is `v0.9.0` (2026-11-11T19:29Z). Test counts come from the
+## [1.0.0] - 2026-11-24
+Version 1.0.0 is the current release.
+Test counts come from the
 results hub (`benchmarks/artifacts/hub/RESULTS.json`, updated
-2026-11-24T07:29:28Z): its `environment-setup` lane runs
-`python -m unittest discover -s tests` and reports **79 passed / 0 failed / 0
-skipped** (measured 2026-11-24T07:29:28Z) — re-measured in this session with that
-same command: `Ran 79 tests … OK`. The hub's unittest parser reads `Ran N tests`
-and carries no subtest figure; this session's `python -m pytest tests -q` on the
-same tree reports `79 passed, 113 subtests passed`, so the 73 plus 111 this file
-quoted was stale. Suite-wide totals live in the hub, not here.
+2026-11-24T13:27:28Z): its `environment-setup` lane runs
+`python -m unittest discover -s tests` and reports **89 passed / 0 failed / 0
+skipped** after the supervised-core topology change (measured 2026-11-24). The hub's
+unittest parser reads `Ran N tests` and carries no subtest figure. An earlier revision
+of this file quoted 73 plus 111 subtests, which was stale. Suite-wide totals live in
+the hub, not here.
 
 ### Added
+- `--download-model`: an explicit install action for the Fennec-ready
+  `Liso/qwen36-35b-colibri` int4 checkpoint (22.78 GiB). It installs
+  `fennec-core[models]`, calls the core's existing completeness-checked downloader,
+  and writes `<models_root>/qwen36-35b` into the planned config; plan and fetch-only
+  modes never download it
 - README hero published
 - the `economy` concept (`Liso7150/fennec-economy`) and its `requires` entries on
   `inference`, `desktop` and `coding-agent`. The three Rust crates those features build all
@@ -48,8 +51,7 @@ quoted was stale. Suite-wide totals live in the hub, not here.
   like core or the CLI rather than reported "untouched"; a dirty, diverged or
   wrong-branch checkout raises instead of moving. Guarded by
   `test_the_fennec_engine_is_pulled_like_any_other_fennec_checkout` and
-  `test_an_update_pulls_a_fennec_checkout` (`tests/test_plan.py:640`, `:630`; the
-  engine test also pins the manifest branch to `master`)
+  `test_an_update_pulls_a_fennec_checkout` (`tests/test_plan.py:640`, `:630`)
 - A Colibri checkout is never chosen as an engine root. `ENGINE_FALLBACK` is gone
   from `fennec_setup/config.py`; `~/Colibri` and `D:/Colibri` survive only in
   `ENGINE_LEGACY` (`fennec_setup/config.py:43`), i.e. recognised so an old manifest
@@ -59,6 +61,12 @@ quoted was stale. Suite-wide totals live in the hub, not here.
   (`tests/test_config.py:204`, `:198`), and by `repos.json`, whose Colibri credit
   row now reads "historical credit only; Fennec is the one engine and no Colibri
   checkout is launched, built or fetched"
+
+### Changed
+- Setup plans now launch the core-supervised PWA/API on `127.0.0.1:8787`, pin the
+  optional Rust auxiliary/chat service to `127.0.0.1:8788` with `FENNEC_AGENT_ADDR`,
+  and keep the engine on `8184`. Coding readiness is a four-feature capability
+  check, not health or chat (`40bc0a8`)
 
 ### Removed
 - the legacy Colibri engine fallback that HEAD still carries: at `b3d0053` a
@@ -71,8 +79,9 @@ quoted was stale. Suite-wide totals live in the hub, not here.
   `--jev-root` / `--web-engine` flags are gone, and so are the `jev_root` / `web_engine`
   config keys. Both are retired rather than unknown: a config written while they existed
   still loads, because `read_config` prunes the pair, and the next `write_config` drops it
-- `web_task` has one lane: Fennec's own loop on Liquid's hosted **d1.2**, which needs a
-  `LIQUID_API_KEY` and an interpreter that can import `browser_harness.helpers`
+- `web_task` has one lane: Fennec's own loop on a Liquid **d1** model — hosted **d1.2**
+  with `LIQUID_API_KEY`, or a local model through `LIQUID_ENDPOINT` — plus an interpreter
+  that can import `browser_harness.helpers`
 
 ## [0.9.0] - 2026-11-11
 

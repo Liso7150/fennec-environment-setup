@@ -1,161 +1,182 @@
-![Fennec Environment Setup 1.0.0 — the hub that detects your device, plans a feature closure, fetches the right repos, provisions their dependencies, and writes one shared runtime configuration. Python 3.10+, standard library only, 79 tests, 10 features, 11 repos managed, MIT license.](docs/hero.png)
+![Fennec Environment Setup 1.0.0 — the hub that detects your device, plans a feature closure, fetches the right repos, provisions their dependencies, and writes one shared runtime configuration. Python 3.10+, standard library only, 89 tests, 10 features, 11 repos managed, MIT license.](docs/hero.png)
 
 ---
 
 ## At a glance
 
-| Tests | Features | Repos managed | Third-party deps | Subcommands |
+| Tests | Features | Repos managed | Required third-party deps | Subcommands |
 |:---:|:---:|:---:|:---:|:---:|
-| 79 in 3 files | 10 | 11 | 0 (`openvino` optional) | 7 |
+| 89 in 3 files | 10 | 11 | 0 | 7 |
 
-Counts from `tests/`, `repos.json` and `setup.py`. This is an argparse CLI, not an
-installable package — run `setup.py` directly. The sole optional third-party import is
-`openvino`, used to probe for an Intel NPU.
+This is an argparse CLI, not an installable package; run `setup.py` directly. The only optional
+third-party import is `openvino`, used to probe for an Intel NPU.
 
 ## Pipeline
 
-```
- python setup.py
-      │
-      ├─ detect ──► device report + conservative recommendation (read-only)
-      ├─ plan ────► dependency closure over the feature manifest (read-only)
-      ├─ fetch ───► clone or verify checkouts (refuses foreign / dirty / ahead)
-      ├─ install ─► fetch + provision deps + optional engine build
-      │             └─► writes ~/.fennec/config.json only after every action succeeded
-      └─ update ──► git pull --ff-only on installed clean Fennec checkouts
+```text
+python setup.py detect    device report and conservative recommendation; read-only
+python setup.py plan      dependency closure and actions; read-only
+python setup.py fetch     clone or verify selected checkouts
+python setup.py install   fetch, provision, optionally build, then write config
+python setup.py update    fast-forward installed clean checkouts
 ```
 
-Servers are never started for you — the plan prints the exact commands to run.
+The hub never starts servers. It writes `~/.fennec/config.json` only after every install action
+succeeds. Planning and fetch-only operations never download a model.
+
+## Service boundaries
+
+| Service | Default address | Role |
+|---|---|---|
+| `fennec-core/server.py` | `127.0.0.1:8787` | canonical supervised PWA/API; advertises `supervised-agent`, `tool-execution`, `per-call-approvals`, and `agent-polling` |
+| Rust/Axum `fennec-agent` | `127.0.0.1:8788` | auxiliary chat and integrations; advertises `chat-only`; never a coding fallback |
+| Native Fennec engine | `127.0.0.1:8184` | inference and telemetry, supervised by core |
+
+The Rust service binds exactly to `127.0.0.1:8788` unless `FENNEC_AGENT_ADDR` overrides it. A
+bind error does not select port 8787 or another port. The PWA assets live in
+`fennec-coding-agent/web`, but core serves them at the canonical 8787 origin.
 
 ## Prerequisites
 
 | Requirement | Needed for |
 |---|---|
-| Python 3.10+ | everything |
-| Git | fetch / install / update |
-| Rust (`cargo`) | `install --build` only |
+| Python 3.10+ | all commands |
+| Git | fetch, install, and update |
+| Rust (`cargo`) | `install --build` |
 
 ## Quick start
 
 ```bash
-python setup.py detect                                      # device + recommended config
+python setup.py detect                                      # inspect the device
 python setup.py plan --features inference,desktop,coding-agent
-python setup.py plan --all --json                           # machine-readable, read-only
-python setup.py install --features inference,desktop
-python setup.py install --features inference --build --model <model-dir>
+python setup.py plan --all --json                           # read-only machine-readable plan
+python setup.py install --features inference,desktop        # provision and write config
+python setup.py install --features inference --download-model
 ```
 
-Or use the **[installer](https://github.com/Liso7150/fennec-installer)**, which bootstraps
-this hub and walks you through feature selection interactively (`python install.py`).
+`--download-model` requires the selected core checkout and downloads the Fennec-ready
+[`Liso/qwen36-35b-colibri`](https://huggingface.co/Liso/qwen36-35b-colibri) checkpoint into
+`<models-root>/qwen36-35b`, then selects it. The download is up to **22.78 GiB**, keeps existing
+files, supports resume, and verifies the required JSON, tokenizer, and safetensors files.
+`HF_TOKEN` is read only from the environment and is never written to the config.
+
+To use an existing model instead, pass `--model <model-dir>`. `--model` and `--download-model`
+are mutually exclusive. A `--dry-run` or fetch-only command does not download either selection.
+
+The engine is built with `cargo build --release`. The hub probes `target/release`,
+`target/debug`, and the engine root for `fennec(.exe)` and invokes that binary directly; it does
+not substitute another engine.
+
+Alternatively, use the [installer](https://github.com/Liso7150/fennec-installer) for an
+interactive feature-selection flow:
+
+```bash
+python install.py
+```
 
 ## Commands
 
-| Command | What it does |
+| Command | Purpose |
 |---|---|
-| `detect [--disk <path>]` | OS, arch, CPU/RAM, NVIDIA/Vulkan/Apple GPUs, Intel NPU, free disk, Python |
-| `features` | list installable features and their dependency closure |
-| `plan --features … \| --all [--json]` | read-only action plan; `--dry-run` on fetch/install does the same |
+| `detect [--disk <path>]` | report OS, architecture, CPU/RAM, GPUs, Intel NPU, disk, and Python |
+| `features` | list features and their dependency closure |
+| `plan --features … \| --all [--json]` | print a read-only action plan |
 | `fetch --features …` | clone or verify checkouts only |
-| `install --features … [--build] [--model <model-dir>]` | provision deps, optionally build the engine, then write the config |
-| `update` | fast-forward every installed clean checkout |
+| `install --features … [--build] [--model <dir> \| --download-model]` | provision dependencies, optionally build, and write config |
+| `update` | fast-forward installed clean checkouts |
 | `version` / `--version` | print `fennec-setup 1.0.0` |
 
 | Action | Guarantee |
 |---|---|
-| `plan` / `--dry-run` | no clone, no install, no config write, no network mutation, no server |
-| `fetch` | refuses a foreign origin, a dirty tree or local commits — a patched legacy engine is never reset behind your back |
-| `install` | config written **only after every action succeeded** |
-| `update` | `--ff-only`; dirty/ahead/foreign checkouts refused; upstream outlets never pulled — `fetch --update` and `update` both print a skip note for OpenBot, which moves only inside its own checkout |
+| `plan` / `--dry-run` | no clone, install, model download, config write, network mutation, or server |
+| `fetch` | refuses foreign origins, dirty trees, and local commits |
+| `install` | writes config only after every action succeeds |
+| `update` | uses `--ff-only`; dirty, ahead, and foreign checkouts are refused |
+
+OpenBot is an upstream outlet. `fetch --update` and `update` do not pull it; it moves only
+inside its own checkout.
 
 ## Features
 
 | Feature | Requires | Notes |
 |---|---|---|
-| `inference` | engine, core, cli | local Fennec engine plus the shared runtime/CLI |
-| `desktop` | engine, core, desktop, coding-agent | native Rust/GPUI app; packaging is a separate step |
-| `coding-agent` | engine, core, coding-agent | shared agent server plus web/PWA UI |
+| `inference` | engine, core, cli | native Fennec inference with the shared runtime and CLI |
+| `desktop` | engine, core, desktop, coding-agent | native Rust/GPUI app; packaging is separate |
+| `coding-agent` | engine, core, coding-agent | core-hosted supervised PWA/API plus auxiliary Rust chat/integrations |
 | `jetbrains` | engine, core, jetbrains | IDE plugin; package it separately |
 | `speech` | core | local STT sidecar on `127.0.0.1:8183`, started on demand |
-| `npu` | core | accelerator sidecar only, **not** a decoder; prebuilt IR embedding model, no optimum-intel, no torch |
-| `fine-tune` | engine, finetune | explicit opt-in; nothing downloads or trains implicitly |
-| `mobile` | core, coding-agent | PWA on the same device (desktop or Termux phone); engine on demand |
-| `browser-outlets` | core, openbot | `coworker_task` gets OpenBot, cloned only: nothing installed, patched or started. `web_task` needs no checkout at all — it is Fennec's own loop on a Liquid **d1** model, so it wants an endpoint to ask - a `LIQUID_API_KEY` for the hosted `d1.2`, or a `LIQUID_ENDPOINT` for the free local `d1-2B` - and an interpreter that can import `browser_harness.helpers`; this feature builds that interpreter as a venv of its own at `~/.fennec/browser-tools/fennec/.venv` and never touches the one the apps run on |
-| `installer` | installer | download the portable bootstrap itself |
+| `npu` | core | accelerator sidecar, not a decoder; prebuilt IR embedding model, no Optimum Intel or Torch |
+| `fine-tune` | engine, finetune | explicit opt-in; no implicit download or training |
+| `mobile` | core, coding-agent | same-device PWA on desktop or Termux; engine on demand |
+| `browser-outlets` | core, openbot | `coworker_task` uses OpenBot; `web_task` uses Fennec's Liquid d1 browser loop |
+| `installer` | installer | fetch the portable bootstrap itself |
 
-`desktop`, `coding-agent`, `jetbrains`, `speech` and `mobile` also provision the STT pins
+`desktop`, `coding-agent`, `jetbrains`, `speech`, and `mobile` provision
 `faster-whisper==1.2.1` and `av>=14,<18`. `npu` provisions `openvino`,
-`openvino-tokenizers`, `numpy`, `huggingface-hub` and fetches the prebuilt IR embedding
-model into `<models_root>/embed/bge-base-en-v1.5-int8-ov`.
+`openvino-tokenizers`, NumPy, and `huggingface-hub`, and fetches the embedding model into
+`<models-root>/embed/bge-base-en-v1.5-int8-ov`.
+
+The browser outlet builds its own virtual environment under
+`~/.fennec/browser-tools/fennec/.venv`; it never changes the interpreter used by the apps.
+`web_task` needs either `LIQUID_API_KEY` for hosted d1.2 or `LIQUID_ENDPOINT` for a local
+System One-compatible d1-2B server. Fennec's engine exposes
+`/v1/chat/completions`, not `/v1/systemone`, so it is not a substitute for that decision
+endpoint.
 
 ## Layout
 
-| Concept | Repo | Local path |
+| Concept | Repository | Default checkout |
 |---|---|---|
 | Engine | `Liso7150/fennec` | `~/Fennec` |
 | Shared core | `Liso7150/fennec-core` | `~/Fennec-Suite/fennec-core` |
-| CLI wrapper | `Liso7150/fennec-cli` | `~/Fennec-Suite/fennec-cli` |
-| Desktop app | `Liso7150/fennec-desktop` | `~/Fennec-Suite/fennec-desktop` |
+| CLI | `Liso7150/fennec-cli` | `~/Fennec-Suite/fennec-cli` |
+| Desktop | `Liso7150/fennec-desktop` | `~/Fennec-Suite/fennec-desktop` |
 | Coding agent | `Liso7150/fennec-coding-agent` | `~/Fennec-Suite/fennec-coding-agent` |
 | Shared UI | `Liso7150/fennec-ui` | `~/Fennec-Suite/fennec-ui` |
 | Shared economy | `Liso7150/fennec-economy` | `~/Fennec-Suite/fennec-economy` |
 | JetBrains | `Liso7150/fennec-jetbrains` | `~/Fennec-Suite/fennec-jetbrains` |
 | Installer | `Liso7150/fennec-installer` | `~/Fennec-Suite/fennec-installer` |
 | Fine-tune | `Liso7150/fennec-finetune` | `~/Fennec-Suite/fennec-finetune` |
-| OpenBot outlet | `CopilotKit/OpenBot` (upstream) | `~/Fennec-Suite/OpenBot` |
+| OpenBot | `CopilotKit/OpenBot` | `~/Fennec-Suite/OpenBot` |
 
-Pass `--root <path>` to keep every checkout and cache under one folder: `ROOT/engine`,
-`ROOT/suite`, `ROOT/models`, `ROOT/cache`, with this hub at `ROOT/setup`. An older manifest
-or config may still carry absolute drive-letter roots from a previous install; those are
-recognised **only so they can be migrated**. Fennec is the only engine: a leftover Colibri
-checkout on disk is never chosen as an engine root, and a manifest that names one is
-migrated to the Fennec default.
-
-The engine is built with `cargo build --release`. The plan probes `target/release`,
-`target/debug` and the root for `fennec(.exe)` and launches the binary directly; a root
-with no Fennec binary is reported as missing, never replaced by another engine.
+Pass `--root <path>` to place `engine`, `suite`, `models`, and `cache` under one directory, with
+this hub at `ROOT/setup`. Older absolute roots are recognized only for migration. Fennec is the
+only supported engine; a leftover Colibri checkout is never selected.
 
 ## Config contract
 
-One file, `~/.fennec/config.json` (override with `FENNEC_CONFIG`), plus matching `FENNEC_*`
-environment variables, is shared by every app in the suite. The workspace defaults to
-`suite_root`. Caches (`HF_HOME`, pip) live under `cache_root`, never inside the repos.
-The optional outlets have keys too — `openbot_url` / `FENNEC_OPENBOT_URL`, and `web_python` /
-`FENNEC_WEB_PYTHON`, which pins which interpreter runs Fennec's own browser loop when you do
-not want the venv this hub builds — and they stay unwritten
-unless you set them. The keys of the lane that used to be a second choice, `jev_root` and
-`web_engine`, are retired: a config written back then still loads, because the pair is pruned
-on read, and the next write leaves them out. Secrets never enter this
-file; only `FENNEC_API_KEY` and `FENNEC_APP_TOKEN` carry them, and `LIQUID_API_KEY` (the
-d1.2 decision API) live in the environment, never in the config; `LIQUID_ENDPOINT` is
-a plain address, not a secret, and may be set or unset.
+Every app reads `~/.fennec/config.json`, or the file selected by `FENNEC_CONFIG`, plus matching
+`FENNEC_*` environment variables. The workspace defaults to `suite_root`; Hugging Face and pip
+caches live under `cache_root`, not inside repositories.
 
-> [!NOTE]
-> There is no shared virtualenv. Dependencies go into the interpreter the apps resolve
-> (`python` on PATH, or the one you configure).
+Optional outlet keys are `openbot_url` / `FENNEC_OPENBOT_URL` and `web_python` /
+`FENNEC_WEB_PYTHON`. Retired `jev_root` and `web_engine` entries are pruned when loaded and omitted
+on the next write. Secrets never enter the JSON file: `FENNEC_API_KEY`, `FENNEC_APP_TOKEN`, and
+`LIQUID_API_KEY` remain environment variables. `LIQUID_ENDPOINT` is a non-secret address.
 
-Phones can run the core and PWA locally in Termux, with the engine on demand when a
-compatible small model exists; Android browsers and iOS are PWA clients of a Fennec host.
+There is no shared virtualenv. Dependencies go into the interpreter resolved from `python` or the
+configured interpreter path.
+
+Phones can run core and the PWA locally in Termux when a compatible model is available. Android
+browsers and iOS use a PWA client connected to a Fennec host.
 
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v     # 79 checks across 3 files
+python -m unittest discover -s tests -v     # 89 checks across 3 files
 ```
 
-The suite is offline: hardware probes and git are injected, no checkout is cloned and no
-server is started. The shared-config validator is compared against `fennec-core`'s
-authoritative loader whenever a core checkout is available, and that comparison skips when
-it is not.
+Tests are offline: hardware probes and Git are injected, no checkout is cloned, and no server is
+started. When a core checkout is available, its configuration loader is compared with the shared
+validator; that comparison otherwise skips.
 
 ## Credits
 
-The engine is ours; the suite builds on upstream projects it does not fork or vendor:
-
 | Upstream | Role |
 |---|---|
-| [Fennec](https://github.com/Liso7150/fennec) | the engine: one native Rust binary, OpenAI-compatible HTTP on `127.0.0.1:8184` |
-| [Colibri](https://github.com/JustVugg/colibri) | base idea: device-tiered MoE inference (historical credit; no Colibri checkout is launched, built or fetched) |
-| [AirLLM](https://github.com/lyogavin/airllm) | layer-streamed inference and streamed LoRA training |
-| [browser-harness](https://github.com/browser-use/browser-harness) | the CDP transport Fennec's own loop drives Chrome with, pip-installed from PyPI (pinned) into that venv; a dependency of the lane, never a checkout this hub edits |
-| [OpenBot](https://github.com/CopilotKit/OpenBot) | coworker workspace behind `coworker_task`; its loopback AG-UI routes, used as upstream |
-| [Liquid d1](https://api.liquid.ai/decisions/v1/systemone) | decision model behind `web_task`: Fennec's own loop asks it for one operation + element index per step. The hosted `d1.2` is a paid API (`LIQUID_API_KEY`); the free open-weight `d1-2B` answers the same call on loopback (`LIQUID_ENDPOINT`) but needs a System One-compatible server already running there — Fennec's engine serves `/v1/chat/completions`, not `/v1/systemone`, so this hub clones or installs nothing for either half |
+| [Fennec](https://github.com/Liso7150/fennec) | native Rust inference engine on `127.0.0.1:8184` |
+| [Colibri](https://github.com/JustVugg/colibri) | device-tiered MoE design lineage; never fetched or launched by this hub |
+| [AirLLM](https://github.com/lyogavin/airllm) | layer-streamed inference and streamed LoRA training lineage |
+| [browser-harness](https://github.com/browser-use/browser-harness) | pinned CDP transport installed into the browser-tools environment |
+| [OpenBot](https://github.com/CopilotKit/OpenBot) | upstream coworker workspace behind `coworker_task` |
+| [Liquid d1](https://api.liquid.ai/decisions/v1/systemone) | decision model used by `web_task`; hosted d1.2 is paid, local d1-2B requires a compatible server |

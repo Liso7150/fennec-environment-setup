@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -50,6 +51,26 @@ class SetupCliTests(unittest.TestCase):
             self.assertIn('"config_path"', out)
             self.assertFalse(config.exists())
             self.assertFalse((home / "root").exists())
+
+    def test_download_model_flag_reaches_the_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / "root"
+            config = home / "config.json"
+            code, out, err = self.run_main([
+                "plan", "--features", "inference", "--download-model", "--json",
+                "--root", str(root), "--config", str(config)])
+            self.assertEqual(code, 0, err)
+            plan = json.loads(out)
+            target = str(root / "models/qwen36-35b").replace("\\", "/")
+            self.assertTrue(plan["download_model"])
+            self.assertEqual(plan["config"]["model"], target)
+            self.assertEqual(plan["model_status"],
+                             "planned download via --download-model; not downloaded during planning or fetch-only")
+            self.assertTrue(any(action["label"] == "download recommended model (explicit opt-in)"
+                                for action in plan["actions"]))
+            self.assertFalse(config.exists())
+            self.assertFalse(root.exists())
 
     def test_update_pulls_every_installed_checkout(self):
         import importlib

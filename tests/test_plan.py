@@ -14,7 +14,7 @@ from fennec_setup import devices  # noqa: E402
 from fennec_setup.devices import Device, detect, recommend  # noqa: E402
 from fennec_setup.fetch import load_manifest, repos_for_features  # noqa: E402
 from fennec_setup.provision import (BROWSER_TRANSPORT, browser_env, build_plan,  # noqa: E402
-                                    print_plan, resolve_engine, selected_features)
+                                    execute_plan, print_plan, resolve_engine, selected_features)
 
 CONCEPTS = ("engine", "core", "cli", "desktop", "coding-agent", "ui", "economy",
             "jetbrains", "installer", "finetune")
@@ -122,6 +122,103 @@ class PlanTests(unittest.TestCase):
         self.assertIn("Plan only", out.getvalue())
         engine = next(repo for repo in plan["repos"] if repo["concept"] == "engine")
         self.assertEqual(engine["local"], slash(self.home / "engine"))
+
+    def test_download_model_requires_a_selected_core_checkout(self):
+        with self.assertRaisesRegex(ValueError, "requires a selected core checkout"):
+            self.plan(features=("installer",), download_model=True)
+
+    def test_download_model_installs_core_models_extra_then_calls_existing_helper(self):
+        plan = self.plan(download_model=True)
+        actions = plan["actions"]
+        core = next(index for index, action in enumerate(actions)
+                    if action["label"] == "install editable core")
+        download = next(index for index, action in enumerate(actions)
+                        if action["label"] == "download recommended model (explicit opt-in)")
+        self.assertEqual(download, core + 1)
+        project = slash(self.home / "suite/fennec-core")
+        self.assertEqual(actions[core]["argv"],
+                         ["python", "-m", "pip", "install", "--editable", f"{project}[models]"])
+        self.assertEqual(actions[download]["argv"], [
+            "python", "-c",
+            "from setup_wizard import download_recommended_model; import sys; "
+            "download_recommended_model(sys.argv[1])",
+            slash(self.home / "models")])
+        self.assertEqual(actions[download]["requires"], [f"{project}/pyproject.toml"])
+        self.assertNotIn("snapshot_download", " ".join(actions[download]["argv"]))
+
+    def test_download_model_sets_planned_config_status_run_and_size_warning(self):
+        plan = self.plan(download_model=True)
+        target = slash(self.home / "models/qwen36-35b")
+        self.assertTrue(plan["download_model"])
+        self.assertEqual(plan["config"]["model"], target)
+        self.assertIn("model", plan["explicit_keys"])
+        self.assertEqual(plan["model_status"],
+                         "planned download via --download-model; not downloaded during planning or fetch-only")
+        engine = next(command for command in plan["run"] if command["label"].startswith("engine"))
+        self.assertEqual(engine["argv"][engine["argv"].index("--model") + 1], target)
+        warning = next(message for message in plan["warnings"] if "explicit opt-in" in message)
+        for text in ("Liso/qwen36-35b-colibri", "22.78 GiB", "--download-model", "fetch-only"):
+            self.assertIn(text, warning)
+        self.assertFalse(any("Inference is NOT ready" in message for message in plan["warnings"]))
+
+    def test_model_download_is_opt_in_and_explicit_model_is_preserved(self):
+        default = self.plan()
+        self.assertFalse(default["download_model"])
+        self.assertNotIn("model", default["config"])
+        self.assertFalse(any("download recommended model" in action["label"]
+                             for action in default["actions"]))
+        model = self.selected_model()
+        plan = build_plan(manifest(), ["inference"],
+                          overrides=dict(self.overrides, model=str(model)),
+                          config=str(self.config), environ={}, home=self.home, device=device())
+        self.assertEqual(plan["config"]["model"], slash(model))
+        self.assertIn("the engine reads it as-is", plan["model_status"])
+        engine = next(command for command in plan["run"] if command["label"].startswith("engine"))
+        self.assertEqual(engine["argv"][engine["argv"].index("--model") + 1], slash(model))
+        self.assertFalse(any("download recommended model" in action["label"]
+                             for action in plan["actions"]))
+
+    def test_download_model_rejects_different_explicit_model_but_accepts_same_target(self):
+        different = self.selected_model()
+        with self.assertRaisesRegex(ValueError, "--model and --download-model select different models"):
+            build_plan(manifest(), ["inference"],
+                       overrides=dict(self.overrides, model=str(different)),
+                       config=str(self.config), environ={}, home=self.home, device=device(),
+                       download_model=True)
+        same = slash(self.home / "models/qwen36-35b") + "/"
+        plan = build_plan(manifest(), ["inference"],
+                          overrides=dict(self.overrides, model=same),
+                          config=str(self.config), environ={}, home=self.home, device=device(),
+                          download_model=True)
+        self.assertEqual(plan["config"]["model"], slash(self.home / "models/qwen36-35b"))
+
+    def test_planning_download_model_never_runs_actions_or_writes_config(self):
+        from fennec_setup import provision
+        with mock.patch.object(provision, "_run_action") as run, \
+                mock.patch.object(provision, "write_config") as write:
+            plan = self.plan(download_model=True)
+        self.assertTrue(any("download recommended model" in action["label"]
+                            for action in plan["actions"]))
+        run.assert_not_called()
+        write.assert_not_called()
+        self.assertFalse(self.config.exists())
+        self.assertFalse((self.home / "models/qwen36-35b").exists())
+
+    def test_fetch_only_download_model_never_runs_install_actions(self):
+        from fennec_setup import provision
+        plan = self.plan(download_model=True)
+        emitted = []
+        with mock.patch.object(provision, "validate_checkout"), \
+                mock.patch.object(provision, "fetch_repo", return_value="fetched") as fetch, \
+                mock.patch.object(provision, "_run_action") as run, \
+                mock.patch.object(provision, "write_config") as write:
+            execute_plan(plan, install=False, emit=emitted.append)
+        self.assertEqual(fetch.call_count, len(plan["repos"]))
+        run.assert_not_called()
+        write.assert_not_called()
+        self.assertFalse(self.config.exists())
+        self.assertFalse((self.home / "models/qwen36-35b").exists())
+        self.assertTrue(any("Fetch-only complete" in message for message in emitted))
 
     def test_cargo_builds_require_their_path_dependency_checkouts(self):
         # fennec-cli and fennec-desktop both say `fennec-economy = { path = "../fennec-economy" }`

@@ -42,12 +42,21 @@ MIN_RUSTC = (1, 85)
 _rustc_cache = {}
 
 # The supervised core owns the PWA/API front door. Rust is a separate auxiliary/chat
-# service, and its bind is explicit because its default still tries 8787 first.
+# service whose explicit bind leaves the core's port alone.
 CORE_HOST = "127.0.0.1"
 CORE_PORT = "8787"
 CORE_URL = f"http://{CORE_HOST}:{CORE_PORT}"
 RUST_AGENT_ADDR = "127.0.0.1:8788"
 CORE_CAPABILITIES = ("supervised-agent", "tool-execution", "per-call-approvals", "agent-polling")
+
+# Identity mirrors fennec-core/setup_wizard.py; that module remains the only downloader.
+RECOMMENDED_MODEL_REPO = "Liso/qwen36-35b-colibri"
+RECOMMENDED_MODEL_DIR = "qwen36-35b"
+RECOMMENDED_MODEL_GIB = 22.78
+RECOMMENDED_MODEL_CODE = (
+    "from setup_wizard import download_recommended_model; import sys; "
+    "download_recommended_model(sys.argv[1])"
+)
 
 
 def _slash(path):
@@ -124,16 +133,24 @@ def selected_features(manifest, features=None, all_features=False):
 
 
 def build_plan(manifest, features, *, root=None, config=None, overrides=None,
-               build=False, update=False, device=None,
+               build=False, update=False, download_model=False, device=None,
                environ=None, home=None):
     values, path = resolve_config(manifest, root=root, config=config, overrides=overrides,
                                   environ=environ, home=home)
+    recommended_model = _slash(f"{values['models_root']}/{RECOMMENDED_MODEL_DIR}")
+    explicit_model = (overrides or {}).get("model")
+    if (download_model and explicit_model
+            and Path(values.get("model", "")) != Path(recommended_model)):
+        raise ValueError("--model and --download-model select different models; pass only one, "
+                         f"or use --model {recommended_model} with --download-model")
     dev = device or detect(values["models_root"])
     rec = recommend(dev)
     values, path = resolve_config(manifest, root=root, config=config, overrides=overrides,
                                   environ=environ, home=home, recommendation=rec)
     repos = repos_for_features(resolved_manifest(manifest, values), features)
     locations = {r["concept"]: r["local"] for r in repos}
+    if download_model and "core" not in locations:
+        raise ValueError("--download-model requires a selected core checkout")
     actions, missing, warnings = [], [], [rec["note"]]
     explicit = set(k for k, v in (overrides or {}).items() if v is not None)
     if root:
@@ -142,6 +159,13 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
         explicit.add("web_root")
     if root or "engine_root" in explicit:
         explicit.add("python")
+    if download_model:
+        values["model"] = recommended_model
+        explicit.add("model")
+        warnings.append(
+            f"Recommended model download is explicit opt-in (--download-model): "
+            f"{RECOMMENDED_MODEL_REPO} needs up to {RECOMMENDED_MODEL_GIB:.2f} GiB. "
+            "Planning and fetch-only never download it.")
     def add(label, argv, cwd=None, requires=()):
         actions.append({"label": label, "argv": [str(a) for a in argv], "cwd": cwd,
                         "requires": [str(p) for p in requires]})
@@ -176,8 +200,13 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
         for concept in ("core",):
             if concept in locations:
                 project = locations[concept]
-                add(f"install editable {concept}", [python, "-m", "pip", "install", "--editable", project],
+                requirement = f"{project}[models]" if download_model else project
+                add(f"install editable {concept}", [python, "-m", "pip", "install", "--editable", requirement],
                     requires=[f"{project}/pyproject.toml"])
+                if download_model:
+                    add("download recommended model (explicit opt-in)",
+                        [python, "-c", RECOMMENDED_MODEL_CODE, values["models_root"]],
+                        requires=[f"{project}/pyproject.toml"])
         if packages:
             add("install selected optional dependencies", [python, "-m", "pip", "install", *packages])
         if "browser-outlets" in features:
@@ -257,8 +286,12 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
     engine_root = values["engine_root"]
     engine_path, engine_kind, engine_found = resolve_engine(engine_root, windows=windows)
     model = values.get("model")
-    model_status = ("existing path; the engine reads it as-is, format and size unchecked"
-                    if model and Path(model).exists() else "missing")
+    if download_model:
+        model_status = "planned download via --download-model; not downloaded during planning or fetch-only"
+    elif model and Path(model).exists():
+        model_status = "existing path; the engine reads it as-is, format and size unchecked"
+    else:
+        model_status = "missing"
     if "engine" in locations:
         if not engine_found:
             missing.append(f"Engine binary missing: {engine_path}. Build Fennec with cargo build --release in {engine_root} (install --build plans it).")
@@ -333,6 +366,7 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
     return {"features": list(features), "device": dev.to_dict(), "recommendation": rec,
             "config_path": str(path), "config": values, "explicit_keys": sorted(explicit),
             "repos": repos, "actions": actions, "build": build, "update": update,
+            "download_model": download_model,
             "engine_launcher": engine_path if "engine" in locations else None,
             "engine_kind": engine_kind if "engine" in locations else None,
             "model_status": model_status, "missing": missing, "warnings": warnings,
@@ -422,6 +456,8 @@ def add_plan_options(parser):
         parser.add_argument("--" + key.replace("_", "-"))
     parser.add_argument("--ctx", type=int)
     parser.add_argument("--build", action="store_true", help="include/execute the native builds with install (cargo build --release for Fennec and the CLI; the desktop adds --features gui)")
+    parser.add_argument("--download-model", action="store_true",
+                        help="during install, download the Fennec-ready qwen36-35b int4 model (22.78 GiB) through fennec-core")
     parser.add_argument("--update", action="store_true", help="fast-forward clean matching tracked branches only")
     parser.add_argument("--json", action="store_true", help="machine-readable plan (plan mode only)")
 
@@ -431,4 +467,5 @@ def plan_from_args(manifest, args, features=None):
     overrides = {key: getattr(args, key, None) for key in KEYS}
     return build_plan(manifest, features or selected_features(manifest, args.features, args.all),
                       root=args.root, config=args.config, overrides=overrides,
-                      build=args.build, update=args.update)
+                      build=args.build, update=args.update,
+                      download_model=getattr(args, "download_model", False))
