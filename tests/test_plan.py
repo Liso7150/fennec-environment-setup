@@ -172,7 +172,11 @@ class PlanTests(unittest.TestCase):
         self.assertIn("install editable core", labels)
         self.assertTrue(plan["config_write"])
         self.assertTrue(plan["run"])
-        self.assertTrue(any("same device" in message for message in plan["warnings"]))
+        labels = [command["label"] for command in plan["run"]]
+        self.assertTrue(any(label.startswith("core-supervised PWA/API") for label in labels))
+        self.assertTrue(any(label.startswith("auxiliary/chat service") for label in labels))
+        self.assertTrue(any("same device" in message and "8787" in message and "8788" in message
+                            for message in plan["warnings"]))
 
     def fennec_binary(self, rel="target/release", name=None):
         """A fake built engine; nothing in these tests ever executes it."""
@@ -324,7 +328,8 @@ class PlanTests(unittest.TestCase):
                 self.assertIn("/bin/python", text)
                 self.assertNotIn("fxc.exe", text)
                 labels = {entry["label"] for entry in plan["run"]}
-                self.assertTrue(any(label.startswith("coding-agent PWA/API") for label in labels), labels)
+                self.assertTrue(any(label.startswith("core-supervised PWA/API") for label in labels), labels)
+                self.assertTrue(any(label.startswith("auxiliary/chat service") for label in labels), labels)
 
     def test_an_unbuilt_root_still_names_the_release_binary(self):
         plan = self.plan(build=True)
@@ -443,16 +448,36 @@ class PlanTests(unittest.TestCase):
         self.assertFalse([p for p in packages if "optimum" in p or p == "torch"],
                          "the IR model is downloaded, so no exporter belongs in the sidecar set")
 
-    def test_the_agent_advice_names_the_rust_front_door_and_a_separate_core(self):
+    def test_the_agent_advice_names_the_core_front_door_and_auxiliary_rust(self):
         plan = self.plan(features=("desktop",))
-        rust = next(command for command in plan["run"] if "coding-agent PWA/API" in command["label"])
-        # The Rust binary starts the server directly; it takes no `serve` verb.
+        core = next(command for command in plan["run"]
+                    if "core-supervised PWA/API" in command["label"])
+        self.assertEqual(core["argv"][-5:],
+                         ["serve", "--host", "127.0.0.1", "--port", "8787"])
+        self.assertIn("fennec-agent", Path(core["argv"][0]).name)
+        self.assertIn("fennec-core/server.py", core["label"])
+        self.assertNotIn("8790", " ".join(core["argv"]))
+        rust = next(command for command in plan["run"]
+                    if "auxiliary/chat service" in command["label"])
+        # The Rust binary starts the server directly; its explicit environment,
+        # rather than a port argument or fallback, pins the auxiliary service.
         self.assertEqual(rust["argv"][1:], [])
         self.assertIn("fennec-agent", Path(rust["argv"][0]).name)
+        self.assertEqual(rust["env"], {"FENNEC_AGENT_ADDR": "127.0.0.1:8788"})
         self.assertIn("8788", rust["label"])
-        core = next(command for command in plan["run"] if "Python core compatibility" in command["label"])
-        self.assertEqual(core["argv"][-2:], ["--port", "8790"])
-        self.assertIn("serve", core["argv"])
+
+    def test_core_readiness_advice_requires_the_supervised_capabilities(self):
+        plan = self.plan(features=("inference",))
+        warning = next(message for message in plan["warnings"]
+                       if "Coding readiness is capability-gated" in message)
+        self.assertIn("GET http://127.0.0.1:8787/api/capabilities", warning)
+        self.assertIn("X-Fennec-Client: 1", warning)
+        for feature in ("supervised-agent", "tool-execution", "per-call-approvals", "agent-polling"):
+            self.assertIn(feature, warning)
+        self.assertIn("health or chat alone is insufficient", warning)
+        self.assertIn("fail closed", warning)
+        self.assertFalse(any("auxiliary/chat service" in command["label"]
+                             for command in plan["run"]))
 
     def test_a_core_without_outlets_says_which_tools_stay_off(self):
         plan = self.plan(features=("inference",))
@@ -567,6 +592,25 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("only engine", engine["description"])
         self.assertNotIn("c/coli", engine["description"], "no other engine is a fallback")
         self.assertIn("Fennec", self.manifest["features"]["inference"]["description"])
+
+    def test_manifest_describes_the_supervised_core_and_auxiliary_rust(self):
+        repos = {repo["concept"]: repo for repo in self.manifest["repos"]}
+        core = repos["core"]["description"]
+        self.assertIn("Core-supervised PWA/API host", core)
+        self.assertIn("fennec-core/server.py", core)
+        self.assertIn("127.0.0.1:8787", core)
+        for feature in ("supervised-agent", "tool-execution", "per-call-approvals", "agent-polling"):
+            self.assertIn(feature, core)
+        rust = repos["coding-agent"]["description"]
+        self.assertIn("Auxiliary/chat", rust)
+        self.assertIn("127.0.0.1:8788", rust)
+        self.assertIn("FENNEC_AGENT_ADDR", rust)
+        self.assertIn("no 8787 fallback", rust)
+        self.assertIn("127.0.0.1:8184", repos["engine"]["description"])
+        for name in ("desktop", "coding-agent", "mobile"):
+            description = self.manifest["features"][name]["description"]
+            self.assertIn("8787", description)
+            self.assertIn("8788", description)
 
     def test_upstream_credits_present(self):
         credits = self.manifest.get("credits", [])

@@ -41,6 +41,14 @@ BROWSER_TRANSPORT = "browser-harness==0.1.13"
 MIN_RUSTC = (1, 85)
 _rustc_cache = {}
 
+# The supervised core owns the PWA/API front door. Rust is a separate auxiliary/chat
+# service, and its bind is explicit because its default still tries 8787 first.
+CORE_HOST = "127.0.0.1"
+CORE_PORT = "8787"
+CORE_URL = f"http://{CORE_HOST}:{CORE_PORT}"
+RUST_AGENT_ADDR = "127.0.0.1:8788"
+CORE_CAPABILITIES = ("supervised-agent", "tool-execution", "per-call-approvals", "agent-polling")
+
 
 def _slash(path):
     return str(path).replace("\\", "/")
@@ -245,7 +253,7 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
             needs.append(f"{locations['core']}/src/fennec-client/Cargo.toml")
             needs.append(f"{locations['core']}/src/fennec-workspace-tools/Cargo.toml")
         add("build coding-agent (cargo build --release)", ["cargo", "build", "--release"], project, needs)
-        warnings.append("The PWA/API front door is the Rust fennec-agent binary from fennec-coding-agent/target/release; it binds 127.0.0.1:8787 and falls back to :8788 when occupied.")
+        warnings.append("The Rust fennec-agent binary from fennec-coding-agent/target/release is an auxiliary/chat service pinned to 127.0.0.1:8788 with FENNEC_AGENT_ADDR; the core-supervised PWA/API front door stays on 127.0.0.1:8787.")
     engine_root = values["engine_root"]
     engine_path, engine_kind, engine_found = resolve_engine(engine_root, windows=windows)
     model = values.get("model")
@@ -275,6 +283,10 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
         warnings.append("OpenBot is a separate Next.js service: set it up and start it with its own README commands, then the core reaches it over loopback AG-UI routes (default http://127.0.0.1:3001, override with --openbot-url or FENNEC_OPENBOT_URL).")
         warnings.append("OpenBot issues no machine token for its run API, so only a loopback single-user instance is driven; a remote one is refused by the core.")
     if "core" in locations:
+        warnings.append(
+            f"Coding readiness is capability-gated: GET {CORE_URL}/api/capabilities with "
+            "X-Fennec-Client: 1 must list " + ", ".join(CORE_CAPABILITIES) +
+            "; health or chat alone is insufficient, and a missing feature must fail closed.")
         # d1.2 is the one lane that costs money per step, so the plan says so even when no
         # outlet checkout was selected: the loop runs from an ordinary interpreter.
         warnings.append("web_task is Fennec's own browser loop: it asks a Liquid d1 model one question per step (the hosted d1.2 is a paid API, LIQUID_API_KEY; the free open-weight d1-2B needs a local LIQUID_ENDPOINT instead of a key) and needs an interpreter that can import browser_harness.helpers. --features browser-outlets installs one, --web-python pins any other, and `fennec outlets` says which of the two gates is missing.")
@@ -295,26 +307,25 @@ def build_plan(manifest, features, *, root=None, config=None, overrides=None,
         # The engine mmaps config.json + *.safetensors and converts nothing, so a packed
         # checkpoint handed to it by hand answers in fluent nonsense instead of erroring.
         warnings.append("fennec serve --model takes a DIRECTORY holding config.json and *.safetensors; it converts nothing and validates nothing before loading. A packed int4 checkpoint or a .gguf folder must go through the core, which resolves and converts it first - that is what the desktop app, the PWA and `fennec-convert` do. Serving one directly is the failure mode, not a shortcut.")
-    if "coding-agent" in locations:
-        suffix = ".exe" if windows else ""
-        agent = Path(locations["coding-agent"]) / "target" / "release" / f"fennec-agent{suffix}"
-        run.append({"label": "coding-agent PWA/API (Rust; 127.0.0.1:8787, falls back to :8788)",
-                    "argv": [str(agent)]})
     if "core" in locations:
         base = Path(shutil.which(python) or python).parent
         scripts = base if base.name.lower() in ("scripts", "bin") else base / ("Scripts" if windows else "bin")
         entry = str(scripts / ("fennec-agent.exe" if windows else "fennec-agent"))
-        # The Python core is a separate orchestration/ACP/compatibility service, not the
-        # PWA front door: give it a free port so it never shadows the Rust agent.
-        run.append({"label": "Python core compatibility service (ACP/outlets; not the PWA)",
-                    "argv": [entry, "serve", "--port", "8790"]})
+        run.append({"label": "core-supervised PWA/API (fennec-core/server.py; 127.0.0.1:8787)",
+                    "argv": [entry, "serve", "--host", CORE_HOST, "--port", CORE_PORT]})
+    if "coding-agent" in locations:
+        suffix = ".exe" if windows else ""
+        agent = Path(locations["coding-agent"]) / "target" / "release" / f"fennec-agent{suffix}"
+        run.append({"label": "auxiliary/chat service (Rust; 127.0.0.1:8788)",
+                    "env": {"FENNEC_AGENT_ADDR": RUST_AGENT_ADDR},
+                    "argv": [str(agent)]})
     if "desktop" in locations:
         suffix = ".exe" if windows else ""
         release = Path(locations["desktop"]) / "target" / "release"
         run.append({"label": "desktop", "cwd": locations["desktop"],
                     "argv": [str(release / f"fennec-desktop-gui{suffix}")]})
     if "mobile" in features or dev.client_only or dev.termux:
-        warnings.append("Mobile = Rust coding-agent backend + PWA, on the same device (Termux) or reached from another device over trusted HTTPS with FENNEC_APP_TOKEN. The engine starts on demand; there is no automatic public exposure.")
+        warnings.append("Mobile = core-supervised PWA/API on 127.0.0.1:8787 plus an optional Rust auxiliary/chat service on 127.0.0.1:8788, on the same device (Termux) or reached from another device over trusted HTTPS with FENNEC_APP_TOKEN. The engine stays on 127.0.0.1:8184 and starts on demand; there is no automatic public exposure.")
     if dev.client_only:
         actions = []
         missing.append("Android/iOS is PWA client mode only: execute this installation plan on a Windows/macOS/Linux host")
@@ -394,8 +405,10 @@ def execute_plan(plan, *, install=False, emit=print):
     for message in plan["warnings"]:
         emit("Still required / note: " + message)
     for command in plan["run"]:
+        command_env = (f" (env={json.dumps(command['env'])})"
+                       if command.get("env") else "")
         emit("Run separately — " + command["label"] + ": " + json.dumps(command["argv"]) +
-             (" (cwd=" + command["cwd"] + ")" if command.get("cwd") else ""))
+             (" (cwd=" + command["cwd"] + ")" if command.get("cwd") else "") + command_env)
 
 
 def add_plan_options(parser):
