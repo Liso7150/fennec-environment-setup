@@ -1,4 +1,4 @@
-![Fennec Environment Setup 1.0.0 — the hub that detects your device, plans a feature closure, fetches the right repos, provisions their dependencies, and writes one shared runtime configuration. Python 3.10+, standard library only, 73 tests, 10 features, 11 repos managed, MIT license.](docs/hero.png)
+![Fennec Environment Setup 1.0.0 — the hub that detects your device, plans a feature closure, fetches the right repos, provisions their dependencies, and writes one shared runtime configuration. Python 3.10+, standard library only, 79 tests, 10 features, 11 repos managed, MIT license.](docs/hero.png)
 
 ---
 
@@ -6,7 +6,7 @@
 
 | Tests | Features | Repos managed | Third-party deps | Subcommands |
 |:---:|:---:|:---:|:---:|:---:|
-| 73 in 3 files | 10 | 11 | 0 (`openvino` optional) | 7 |
+| 79 in 3 files | 10 | 11 | 0 (`openvino` optional) | 7 |
 
 Counts from `tests/`, `repos.json` and `setup.py`. This is an argparse CLI, not an
 installable package — run `setup.py` directly. The sole optional third-party import is
@@ -72,7 +72,7 @@ this hub and walks you through feature selection interactively (`python install.
 | Feature | Requires | Notes |
 |---|---|---|
 | `inference` | engine, core, cli | local Fennec engine plus the shared runtime/CLI |
-| `desktop` | engine, core, desktop, coding-agent | Electron app; packaging is a separate step |
+| `desktop` | engine, core, desktop, coding-agent | native Rust/GPUI app; packaging is a separate step |
 | `coding-agent` | engine, core, coding-agent | shared agent server plus web/PWA UI |
 | `jetbrains` | engine, core, jetbrains | IDE plugin; package it separately |
 | `speech` | core | local STT sidecar on `127.0.0.1:8183`, started on demand |
@@ -96,6 +96,8 @@ model into `<models_root>/embed/bge-base-en-v1.5-int8-ov`.
 | CLI wrapper | `Liso7150/fennec-cli` | `~/Fennec-Suite/fennec-cli` |
 | Desktop app | `Liso7150/fennec-desktop` | `~/Fennec-Suite/fennec-desktop` |
 | Coding agent | `Liso7150/fennec-coding-agent` | `~/Fennec-Suite/fennec-coding-agent` |
+| Shared UI | `Liso7150/fennec-ui` | `~/Fennec-Suite/fennec-ui` |
+| Shared economy | `Liso7150/fennec-economy` | `~/Fennec-Suite/fennec-economy` |
 | JetBrains | `Liso7150/fennec-jetbrains` | `~/Fennec-Suite/fennec-jetbrains` |
 | Installer | `Liso7150/fennec-installer` | `~/Fennec-Suite/fennec-installer` |
 | Fine-tune | `Liso7150/fennec-finetune` | `~/Fennec-Suite/fennec-finetune` |
@@ -104,19 +106,19 @@ model into `<models_root>/embed/bge-base-en-v1.5-int8-ov`.
 Pass `--root <path>` to keep every checkout and cache under one folder: `ROOT/engine`,
 `ROOT/suite`, `ROOT/models`, `ROOT/cache`, with this hub at `ROOT/setup`. An older manifest
 or config may still carry absolute drive-letter roots from a previous install; those are
-recognised **only so they can be migrated**. A config that already points at a Colibri root
-keeps it, and when nothing chose a root an existing `~/Colibri` checkout is the fallback
-engine root.
+recognised **only so they can be migrated**. Fennec is the only engine: a leftover Colibri
+checkout on disk is never chosen as an engine root, and a manifest that names one is
+migrated to the Fennec default.
 
 The engine is built with `cargo build --release`. The plan probes `target/release`,
-`target/debug` and the root for `fennec(.exe)` and launches the binary directly; only a
-root with no Fennec binary falls back to `python c/coli`.
+`target/debug` and the root for `fennec(.exe)` and launches the binary directly; a root
+with no Fennec binary is reported as missing, never replaced by another engine.
 
 ## Config contract
 
 One file, `~/.fennec/config.json` (override with `FENNEC_CONFIG`), plus matching `FENNEC_*`
 environment variables, is shared by every app in the suite. The workspace defaults to
-`suite_root`. Caches (`HF_HOME`, pip, npm) live under `cache_root`, never inside the repos.
+`suite_root`. Caches (`HF_HOME`, pip) live under `cache_root`, never inside the repos.
 The optional outlets have keys too — `openbot_url` / `FENNEC_OPENBOT_URL`, and `web_python` /
 `FENNEC_WEB_PYTHON`, which pins which interpreter runs Fennec's own browser loop when you do
 not want the venv this hub builds — and they stay unwritten
@@ -137,7 +139,7 @@ compatible small model exists; Android browsers and iOS are PWA clients of a Fen
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v     # 73 checks across 3 files
+python -m unittest discover -s tests -v     # 79 checks across 3 files
 ```
 
 The suite is offline: hardware probes and git are injected, no checkout is cloned and no
@@ -152,8 +154,8 @@ The engine is ours; the suite builds on upstream projects it does not fork or ve
 | Upstream | Role |
 |---|---|
 | [Fennec](https://github.com/Liso7150/fennec) | the engine: one native Rust binary, OpenAI-compatible HTTP on `127.0.0.1:8184` |
-| [Colibri](https://github.com/JustVugg/colibri) | base idea: device-tiered MoE inference; kept as the legacy `c/coli` fallback |
+| [Colibri](https://github.com/JustVugg/colibri) | base idea: device-tiered MoE inference (historical credit; no Colibri checkout is launched, built or fetched) |
 | [AirLLM](https://github.com/lyogavin/airllm) | layer-streamed inference and streamed LoRA training |
 | [browser-harness](https://github.com/browser-use/browser-harness) | the CDP transport Fennec's own loop drives Chrome with, pip-installed from PyPI (pinned) into that venv; a dependency of the lane, never a checkout this hub edits |
 | [OpenBot](https://github.com/CopilotKit/OpenBot) | coworker workspace behind `coworker_task`; its loopback AG-UI routes, used as upstream |
-| [Liquid d1](https://api.liquid.ai/decisions/v1/systemone) | decision model behind `web_task`: Fennec's own loop asks it for one operation + element index per step. The hosted `d1.2` is a paid API (`LIQUID_API_KEY`); the free open-weight `d1-2B` answers the same call on loopback (`LIQUID_ENDPOINT`), nothing cloned or installed for either |
+| [Liquid d1](https://api.liquid.ai/decisions/v1/systemone) | decision model behind `web_task`: Fennec's own loop asks it for one operation + element index per step. The hosted `d1.2` is a paid API (`LIQUID_API_KEY`); the free open-weight `d1-2B` answers the same call on loopback (`LIQUID_ENDPOINT`) but needs a System One-compatible server already running there — Fennec's engine serves `/v1/chat/completions`, not `/v1/systemone`, so this hub clones or installs nothing for either half |

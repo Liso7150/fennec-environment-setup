@@ -11,9 +11,16 @@ dates.
 
 ## [Unreleased] — 1.0.0 in preparation
 
-Nothing at 1.0.0 is published. The newest release here is `v0.9.0`
-(2026-11-11T19:29Z). Measured on the working tree: 73 tests pass
-(`python -m unittest discover -s tests`, 2026-11-20).
+Nothing at 1.0.0 is published (`fennec_setup.__version__` is `1.0.0`, `b3d0053`).
+The newest release here is `v0.9.0` (2026-11-11T19:29Z). Test counts come from the
+results hub (`benchmarks/artifacts/hub/RESULTS.json`, updated
+2026-11-24T07:29:28Z): its `environment-setup` lane runs
+`python -m unittest discover -s tests` and reports **79 passed / 0 failed / 0
+skipped** (measured 2026-11-24T07:29:28Z) — re-measured in this session with that
+same command: `Ran 79 tests … OK`. The hub's unittest parser reads `Ran N tests`
+and carries no subtest figure; this session's `python -m pytest tests -q` on the
+same tree reports `79 passed, 113 subtests passed`, so the 73 plus 111 this file
+quoted was stale. Suite-wide totals live in the hub, not here.
 
 ### Added
 - README hero published
@@ -31,8 +38,35 @@ Nothing at 1.0.0 is published. The newest release here is `v0.9.0`
 - `browser-outlets` now fills the lane's own interpreter: it creates
   `~/.fennec/browser-tools/fennec/.venv` and pip-installs the pinned
   `browser-harness` transport into it, never into the interpreter the apps run on
+- The Fennec engine rides the ordinary update path. `setup.py update` →
+  `update_installed()` fast-forwards every installed checkout that is not an
+  upstream source with `git pull --ff-only --no-rebase origin <branch>`
+  (`fennec_setup/fetch.py:129`, present at `b3d0053` and unchanged on the
+  working tree). What changed on the
+  working tree is that the engine stopped being exempt: its `repos.json` entry
+  carries no `upstream` flag, so `_is_upstream()` lets it through and it is pulled
+  like core or the CLI rather than reported "untouched"; a dirty, diverged or
+  wrong-branch checkout raises instead of moving. Guarded by
+  `test_the_fennec_engine_is_pulled_like_any_other_fennec_checkout` and
+  `test_an_update_pulls_a_fennec_checkout` (`tests/test_plan.py:640`, `:630`; the
+  engine test also pins the manifest branch to `master`)
+- A Colibri checkout is never chosen as an engine root. `ENGINE_FALLBACK` is gone
+  from `fennec_setup/config.py`; `~/Colibri` and `D:/Colibri` survive only in
+  `ENGINE_LEGACY` (`fennec_setup/config.py:43`), i.e. recognised so an old manifest
+  migrates to the Fennec default. Proved on the working tree by
+  `test_an_existing_colibri_checkout_is_never_chosen` and
+  `test_a_legacy_colibri_manifest_root_is_upgraded_to_fennec`
+  (`tests/test_config.py:204`, `:198`), and by `repos.json`, whose Colibri credit
+  row now reads "historical credit only; Fennec is the one engine and no Colibri
+  checkout is launched, built or fetched"
 
 ### Removed
+- the legacy Colibri engine fallback that HEAD still carries: at `b3d0053` a
+  Colibri checkout on disk was the fallback `engine_root`. On the working tree an
+  unbuilt Fennec checkout is reported as missing, never handed to a `c/coli`
+  launcher found beside it (`test_a_colibri_launcher_alone_is_not_an_engine`,
+  `tests/test_plan.py:505`; `test_a_leftover_colibri_launcher_is_ignored_beside_a_fennec_binary`,
+  `:196`)
 - the second browser lane. `jev` is gone from `repos.json` (concept and credit), the
   `--jev-root` / `--web-engine` flags are gone, and so are the `jev_root` / `web_engine`
   config keys. Both are retired rather than unknown: a config written while they existed
